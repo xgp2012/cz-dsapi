@@ -8,6 +8,12 @@
 
 **与其他项目不同，因为没有明显的工具调用特征，实测按照提示使用此项目个人使用无封号/禁言问题**
 
+## tips
+
+如果你的IP不是中国大陆，就可以使用邮箱注册DeepSeek账号，且支持变体，比如your+1@gmail.com这种写法都能成功注册账号
+
+我们在取多账号token的时候不要直接点击“退出账号” 因为这样会直接吊销之前的userToken，正确做法是直接清除localStorage和cookies（其实只清localStorage也可以但可能在登录新账号时会出现设备异常等无法登录情况，所以建议cookies也一起清掉）
+
 上下文不打在服务端：每条请求都把历史按 `SYSTEM_ROLE_MESSAGES` / ` USER_ROLE_MESSAGES` / `ASSISTANT_ROLE_MESSAGES` 的段落格式拼成一条 prompt，作为一次**全新对话**发给模型。
 
 两种引擎，默认 **direct**（Playwright 驱动真实网页）：
@@ -449,12 +455,6 @@ browser 引擎单轮 2.2–2.9s（浏览器导航 + DOM 轮询）；直连引擎
 
 **页面/接口改版**
 直连：改 `src/direct/client.mjs` 的路径和字段；兜底：改 `src/browser/page-scripts.mjs` 顶部的选择器。
-
-## tips
-
-如果你的IP不是中国大陆，就可以使用邮箱注册DeepSeek账号，且支持变体，比如your+1@gmail.com这种写法都能成功注册账号
-
-我们在取多账号token的时候不要直接点击“退出账号” 因为这样会直接吊销之前的userToken，正确做法是直接清除localStorage和cookies（其实只清localStorage也可以但可能在登录新账号时会出现设备异常等无法登录情况，所以建议cookies也一起清掉）
 
 ## 免责声明
 
