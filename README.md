@@ -47,7 +47,7 @@
 
 ```bash
 npm install
-安装 Go
+#安装 Go
 sudo apt install golang
 npm run pow:build
 ```
