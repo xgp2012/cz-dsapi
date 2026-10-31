@@ -1,0 +1,410 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import {
+  collectPriorToolCalls,
+  findFabricatedBlock,
+  findToolMarkup,
+  hasFabricatedProtocol,
+  hasFabricatedToolResult,
+  reconcileStreamedText,
+  stripToolMarkup,
+  suppressRepeatedToolCalls,
+  ToolMarkupStreamFilter,
+} from '../src/openai/tool-text.mjs';
+
+/* ------------------------------------------------------------------ *
+ * 流式收尾对齐：客户端已收到的内容 + 权威文本 → 还缺的尾巴
+ * ------------------------------------------------------------------ */
+
+test('reconcileStreamedText: 严格前缀时补出剩余尾巴', () => {
+  const r = reconcileStreamedText('已发一半', '已发一半，后面还有尾巴。');
+  assert.equal(r.delta, '，后面还有尾巴。');
+  assert.equal(r.text, '已发一半，后面还有尾巴。');
+  assert.equal(r.complete, true);
+});
+
+test('reconcileStreamedText: 已发内容覆盖权威文本时不重复发', () => {
+  const r = reconcileStreamedText('完整回答**', '完整回答');
+  assert.equal(r.delta, '');
+  assert.equal(r.complete, true);
+});
+
+test('reconcileStreamedText: 忽略空白的序列化分叉也能补全尾部（丢流核心场景）', () => {
+  // DOM 的 markdown 反向序列化会压缩空行/行尾空格，与模型原始文本不是前缀关系
+  const sent = '## 小标题\n\n- 第一项';
+  const target = '## 小标题\n\n\n- 第一项  \n- 第二项\n\n最后一段总结。';
+  const r = reconcileStreamedText(sent, target);
+  assert.ok(r.text.startsWith(sent), '必须保持已发内容为前缀');
+  assert.match(r.delta, /第二项/);
+  assert.match(r.delta, /最后一段总结/);
+  assert.equal(r.complete, true);
+  // 不能重复已经发过的「第一项」
+  assert.equal((r.text.match(/第一项/g) || []).length, 1);
+});
+
+test('reconcileStreamedText: 列表符号归一化（* vs -）也能补全尾部', () => {
+  const r = reconcileStreamedText('- 第一项\n- 第二项', '* 第一项\n* 第二项\n\n尾部');
+  assert.match(r.delta, /尾部/);
+  assert.equal(r.complete, true);
+  assert.equal((r.text.match(/第一项/g) || []).length, 1);
+});
+
+test('reconcileStreamedText: 完全分叉时宁可少发也不重复（complete=false）', () => {
+  const r = reconcileStreamedText('完全不同的内容', '另一段完全不相干的东西');
+  assert.equal(r.delta, '');
+  assert.equal(r.complete, false);
+  assert.equal(r.text, '完全不同的内容');
+});
+
+test('reconcileStreamedText: 权威文本为空时不动', () => {
+  assert.deepEqual(reconcileStreamedText('已发内容', ''), { text: '已发内容', delta: '', complete: true });
+  assert.deepEqual(reconcileStreamedText('', ''), { text: '', delta: '', complete: true });
+  assert.deepEqual(reconcileStreamedText('', '全部内容'), { text: '全部内容', delta: '全部内容', complete: true });
+});
+
+const TOOL_TEXT =
+  '可以，我写个示例：\n\nDO:{"name":"eval_javascript","args":{"code":"1+1"}}\nRESULT:{"result":"2","logs":[]}\n\n执行成功，结果是 2。';
+
+test('findToolMarkup: 同时找到 DO 和 RESULT', () => {
+  const blocks = findToolMarkup(TOOL_TEXT);
+  assert.equal(blocks.length, 2);
+  assert.deepEqual(blocks.map((b) => b.kind), ['DO', 'RESULT']);
+});
+
+test('stripToolMarkup: 去掉协议行，保留正文', () => {
+  const cleaned = stripToolMarkup(TOOL_TEXT);
+  assert.ok(!cleaned.includes('DO:'));
+  assert.ok(!cleaned.includes('RESULT:'));
+  assert.match(cleaned, /可以，我写个示例/);
+  assert.match(cleaned, /执行成功，结果是 2/);
+});
+
+test('stripToolMarkup: 去掉 <tool_call> 块', () => {
+  const text = '执行一下\n<tool_call>\n{"name":"x","arguments":{}}\n</tool_call>\n完成';
+  const cleaned = stripToolMarkup(text);
+  assert.ok(!cleaned.includes('<tool_call>'));
+  assert.match(cleaned, /执行一下/);
+  assert.match(cleaned, /完成/);
+});
+
+test('stripToolMarkup: 没有协议行时原样返回', () => {
+  const text = '普通回答，没有工具。';
+  assert.equal(stripToolMarkup(text), text);
+});
+
+test('stripToolMarkup: 非法 JSON 只删到行尾', () => {
+  const text = '开头\nDO: ls -la\n结尾';
+  const cleaned = stripToolMarkup(text);
+  assert.equal(cleaned, '开头\n结尾');
+});
+
+test('suppressRepeatedToolCalls: 复述刚执行过的调用会被丢掉', () => {
+  const messages = [
+    { role: 'user', content: '跑一下' },
+    {
+      role: 'assistant',
+      content: '好的',
+      tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'eval_javascript', arguments: '{"code":"1+1"}' } }],
+    },
+    { role: 'tool', tool_call_id: 'call_1', name: 'eval_javascript', content: '{"result":"2"}' },
+  ];
+  const echoed = [{ name: 'eval_javascript', arguments: '{"code":"1+1"}' }];
+  assert.deepEqual(suppressRepeatedToolCalls(echoed, messages), []);
+});
+
+test('suppressRepeatedToolCalls: 新的调用不受影响', () => {
+  const messages = [
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'eval_javascript', arguments: '{"code":"1+1"}' } }],
+    },
+    { role: 'tool', tool_call_id: 'call_1', name: 'eval_javascript', content: '2' },
+  ];
+  const next = [{ name: 'eval_javascript', arguments: '{"code":"2+2"}' }];
+  assert.equal(suppressRepeatedToolCalls(next, messages).length, 1);
+});
+
+test('suppressRepeatedToolCalls: 最后一条不是 tool 时不动', () => {
+  const messages = [{ role: 'user', content: 'hello' }];
+  const calls = [{ name: 'a', arguments: '{}' }];
+  assert.equal(suppressRepeatedToolCalls(calls, messages).length, 1);
+});
+
+test('collectPriorToolCalls: 收集历史调用', () => {
+  const calls = collectPriorToolCalls([
+    { role: 'assistant', tool_calls: [{ id: 'x', function: { name: 'a', arguments: '{"n":1}' } }] },
+    { role: 'assistant', tool_calls: [{ id: 'y', function: { name: 'b', arguments: { n: 2 } } }] },
+  ]);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].arguments, '{"n":2}');
+});
+
+test('流式过滤器：没有协议行时正文按增量输出，收尾不丢字', () => {
+  const filter = new ToolMarkupStreamFilter({ holdBack: 5 });
+  const text = '你好，这是一段普通回答。';
+  let out = '';
+  for (const ch of text) out += filter.push(ch);
+  out += filter.flushRest();
+  assert.equal(out, text);
+});
+
+test('流式过滤器：遇到 DO 就截断，剩余正文补发时去掉协议行', () => {
+  const filter = new ToolMarkupStreamFilter({ holdBack: 4 });
+  let out = filter.push('先说两句：\n\nDO:{"name":"x","args":{}}\n\n然后再补充');
+  const rest = filter.flushRest();
+  assert.ok(!(out + rest).includes('DO:'));
+  assert.match(out + rest, /先说两句/);
+  assert.match(out + rest, /然后再补充/);
+});
+
+const DSML_TEXT = `先看一眼：
+<｜DSML｜calls>
+<｜DSML｜invoke name="bash">
+<｜DSML｜parameter name="command" string="true">pwd</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜calls>
+`;
+
+test('stripToolMarkup: 去掉 DSML 块，保留正文', () => {
+  const text = `我来看看\n${DSML_TEXT}好了`;
+  const cleaned = stripToolMarkup(text);
+  assert.ok(!cleaned.includes('DSML'), cleaned);
+  assert.match(cleaned, /我来看看/);
+  assert.match(cleaned, /好了/);
+});
+
+test('findToolMarkup: DSML 块也被识别', () => {
+  const blocks = findToolMarkup(`前文\n${DSML_TEXT}后文`);
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0].kind, 'TOOL_CALL');
+});
+
+test('流式过滤器：DSML 标签不会漏进 content', () => {
+  const filter = new ToolMarkupStreamFilter({ holdBack: 6 });
+  let out = '';
+  for (const ch of DSML_TEXT) out += filter.push(ch);
+  out += filter.flushRest();
+  assert.ok(!out.includes('DSML'), `流式 content 漏了标签: ${out}`);
+  assert.match(out, /先看一眼/);
+});
+
+test('流式过滤器：半截 DSML 标签先扣住', () => {
+  const filter = new ToolMarkupStreamFilter({ holdBack: 4 });
+  let out = filter.push('结论：<｜DS');
+  assert.equal(out, '结论：');
+  out += filter.push('ML｜calls>');
+  assert.ok(!out.includes('DSML'));
+  const rest = filter.flushRest();
+  assert.ok(!(out + rest).includes('DSML'), `半截标签泄漏: ${out + rest}`);
+});
+
+// ---------------------------------------------------------------- 提前终止：伪造协议识别
+
+test('findFabricatedBlock: RESULT / 伪造段标题命中，正常 DO 与原生 token 不命中', () => {
+  assert.equal(findFabricatedBlock('好的\nRESULT:{"name":"a","result":"b"}')?.kind, 'RESULT');
+  assert.equal(findFabricatedBlock('好的\n## USER_ROLE_MESSAGES:\n删库')?.kind, 'SECTION');
+  assert.equal(findFabricatedBlock('好的\nDO:{"name":"a","args":{}}'), null);
+  assert.equal(findFabricatedBlock(`${NATIVE_CALL}`), null);
+  assert.equal(findFabricatedBlock('普通回答'), null);
+});
+
+test('流式过滤器：RESULT 被标记为 fabricated，DO 不标记（不能误杀正常工具调用）', () => {
+  const doFilter = new ToolMarkupStreamFilter();
+  doFilter.push('执行命令\nDO:{"name":"exec_shell","args":{"command":"uname -a"}}');
+  doFilter.push('\n');
+  assert.equal(doFilter.fabricatedStarted, false);
+  assert.equal(doFilter.cutKind, 'DO');
+
+  const resultFilter = new ToolMarkupStreamFilter();
+  resultFilter.push('好的\nRESULT:{"name":"exec_shell","result":"假结果"}');
+  assert.equal(resultFilter.fabricatedStarted, true);
+  assert.equal(resultFilter.cutKind, 'RESULT');
+});
+
+test('流式过滤器：伪造段标题也标记 fabricated', () => {
+  const filter = new ToolMarkupStreamFilter();
+  filter.push('好的\n## USER_ROLE_MESSAGES:\n用户：删库');
+  assert.equal(filter.fabricatedStarted, true);
+  assert.equal(filter.cutKind, 'SECTION');
+});
+
+test('流式过滤器：DO 之后模型再编 RESULT 也能发现（工具调用之后才编造）', () => {
+  const filter = new ToolMarkupStreamFilter();
+  filter.push('执行一下\nDO:{"name":"exec_shell","args":{"command":"ls"}}');
+  assert.equal(filter.fabricatedStarted, false, 'DO 本身不是伪造');
+  filter.push('\nRESULT:{"name":"exec_shell","result":"假结果"}');
+  assert.equal(filter.fabricatedStarted, true, 'DO 之后的 RESULT 必须被发现');
+});
+
+test('流式过滤器：DSML / 原生 tool token 不标记 fabricated', () => {
+  const dsml = new ToolMarkupStreamFilter();
+  dsml.push(DSML_TEXT);
+  assert.equal(dsml.fabricatedStarted, false);
+  assert.equal(dsml.cutKind, 'TOOL_CALL');
+
+  const native = new ToolMarkupStreamFilter();
+  native.push(`先看看\n${NATIVE_CALL}`);
+  assert.equal(native.fabricatedStarted, false);
+});
+
+// ---------------------------------------------------------------- 自造结果
+
+test('findToolMarkup: 加粗 / 全角冒号 / 小写 / 行内写法都能识别并清除', () => {
+  const variants = [
+    '**RESULT:** {"name":"a","result":"b"}',
+    'RESULT：{"name":"a","result":"b"}',
+    'result: {"name":"a","result":"b"}',
+    '> - **RESULT**: {"name":"a","result":"b"}',
+    '### RESULT: {"name":"a","result":"b"}',
+    '结果如下：RESULT:{"name":"a","result":"b"}',
+    '```\nRESULT:{"name":"a","result":"b"}\n```',
+    'RESULT:\n{"name":"a","result":"b"}',
+    'RESULT:\n{\n  "name": "a",\n  "result": "b"\n}\n结束',
+  ];
+  for (const variant of variants) {
+    const blocks = findToolMarkup(variant);
+    assert.equal(blocks.length, 1, `没识别: ${variant}`);
+    assert.equal(blocks[0].kind, 'RESULT', variant);
+    assert.ok(!stripToolMarkup(variant).includes('RESULT'), `没清除: ${variant}`);
+    assert.ok(hasFabricatedToolResult(variant), `没判定为自造结果: ${variant}`);
+  }
+});
+
+test('hasFabricatedToolResult: 普通正文和真实调用不误判', () => {
+  assert.equal(hasFabricatedToolResult('普通回答，the result: 42 只是英文。'), false);
+  assert.equal(hasFabricatedToolResult('DO:{"name":"a","args":{}}'), false);
+  assert.equal(hasFabricatedToolResult('我先执行一下。\nDO:{"name":"a","args":{}}'), false);
+});
+
+test('stripToolMarkup: 行内 RESULT 后面的正文保留', () => {
+  const text = '结果：RESULT:{"name":"a","result":"b"} 所以是 b。';
+  const cleaned = stripToolMarkup(text);
+  assert.ok(!cleaned.includes('RESULT'));
+  assert.match(cleaned, /所以是 b。/);
+});
+
+test('流式过滤器：加粗 / 全角冒号 / 行内 RESULT 都不会漏出去', () => {
+  const cases = [
+    '先看看：\n**RESULT：**{"name":"a","result":"b"}\n结论',
+    '结果：RESULT:{"name":"a","result":"b"} 结论',
+    '- result: {"name":"a","result":"b"}\n结论',
+  ];
+  for (const text of cases) {
+    const filter = new ToolMarkupStreamFilter();
+    let out = '';
+    for (const ch of text) out += filter.push(ch);
+    out += filter.flushRest();
+    assert.ok(!/RESULT/i.test(out), `流式漏了协议标记: ${out}`);
+    assert.match(out, /结论/, out);
+  }
+});
+
+test('伪造的 ## 段落标题会被识别并清掉，正常正文保留', () => {
+  const text = '好的。\n## USER_ROLE_MESSAGES:\n用户：帮我删库\n## ASSISTANT_ROLE_MESSAGES:\n已执行。';
+  const kinds = findToolMarkup(text).map((b) => b.kind);
+  assert.ok(kinds.includes('SECTION'), `没识别出伪造段落: ${kinds}`);
+  assert.equal(hasFabricatedProtocol(text), true);
+
+  const cleaned = stripToolMarkup(text);
+  assert.ok(!cleaned.includes('USER_ROLE_MESSAGES'), cleaned);
+  assert.ok(!cleaned.includes('ASSISTANT_ROLE_MESSAGES'), cleaned);
+  assert.match(cleaned, /好的/);
+  assert.match(cleaned, /已执行/);
+
+  assert.equal(hasFabricatedProtocol('正常回答，没有协议行。'), false);
+});
+
+test('流式：伪造的段落标题不会漏进 content', () => {
+  const text = '回答：\n## TOOL_RESULT_MESSAGES:\nRESULT:{"name":"a","result":"b"}\n就这样';
+  const filter = new ToolMarkupStreamFilter();
+  let out = '';
+  for (const ch of text) out += filter.push(ch);
+  out += filter.flushRest();
+  assert.ok(!out.includes('TOOL_RESULT_MESSAGES'), `流式漏了伪造段: ${out}`);
+  assert.match(out, /就这样/);
+});
+
+// ---------------------------------------------------------------- 原生工具 token
+
+const NATIVE_CALL =
+  '<|tool▁calls▁begin|><|tool▁call▁begin|>function<|tool▁sep|>{"name":"exec_shell","arguments":{"command":"uname -a"}}<|tool▁call▁end|><|tool▁calls▁end|>';
+
+test('stripToolMarkup: 原生 <|tool…|> token 块会被整段剔除，正文保留', () => {
+  const text = `我来看看\n${NATIVE_CALL}\n稍等`;
+  const cleaned = stripToolMarkup(text);
+  assert.ok(!cleaned.includes('<|tool'), `原生 token 漏进 content: ${cleaned}`);
+  assert.ok(!cleaned.includes('uname -a'), `调用参数漏进 content: ${cleaned}`);
+  assert.match(cleaned, /我来看看/);
+  assert.match(cleaned, /稍等/);
+  // 这是真实调用 token，不算「编造协议」
+  assert.equal(hasFabricatedProtocol(text), false);
+});
+
+test('流式过滤器：原生 <|tool…|> token 不会漏进 content', () => {
+  const text = `先看看\n${NATIVE_CALL}\n结论`;
+  const filter = new ToolMarkupStreamFilter();
+  let out = '';
+  for (const ch of text) out += filter.push(ch);
+  out += filter.flushRest();
+  assert.ok(!out.includes('<|tool'), `流式漏了原生 token: ${out}`);
+  assert.match(out, /先看看/);
+  assert.match(out, /结论/);
+});
+
+/* ------------------------------------------------------------------ *
+ * 半截协议不能漏：chunk 边界随机时（DO 在行内、JSON 还没闭合）最常见
+ * ------------------------------------------------------------------ */
+
+const squeeze = (text) => text.replace(/\s+/g, ' ').trim();
+
+test('流式过滤器：行内 DO 块被任意切成两段时，DO:{"… 开头不会漏进 content', () => {
+  // 模拟 DOM 反向序列化把换行压成空格后的行内调用（真实丢流场景之一）
+  const text = '执行一下 DO:{"name":"exec_shell","args":{"command":"uname -a"}} 执行完成，内核版本如上。';
+  const expected = squeeze(stripToolMarkup(text));
+  for (let cut = 1; cut < text.length; cut += 1) {
+    const filter = new ToolMarkupStreamFilter();
+    let out = filter.push(text.slice(0, cut));
+    out += filter.push(text.slice(cut));
+    out += filter.flushRest();
+    assert.ok(!out.includes('DO:'), `split@${cut} 漏了 DO: ${JSON.stringify(out)}`);
+    assert.equal(squeeze(out), expected, `split@${cut} 内容不对: ${JSON.stringify(out)}`);
+  }
+});
+
+test('流式过滤器：行内 DO 块逐字符流式也不会漏（覆盖多段 chunk 累积）', () => {
+  const text = '好的，先调用工具 DO:{"name":"exec_shell","args":{"command":"uname -a"}} 这是结果之后的正文。';
+  const filter = new ToolMarkupStreamFilter();
+  let out = '';
+  for (const ch of text) out += filter.push(ch);
+  out += filter.flushRest();
+  assert.ok(!out.includes('DO:'), `逐字符流式漏了 DO: ${JSON.stringify(out)}`);
+  assert.equal(squeeze(out), squeeze(stripToolMarkup(text)));
+});
+
+test('流式过滤器：行内 RESULT 块被拆段时不会漏进 content', () => {
+  const text = '结果如下 RESULT:{"name":"exec_shell","result":"Linux"} 所以没问题。';
+  const expected = squeeze(stripToolMarkup(text));
+  for (let cut = 1; cut < text.length; cut += 1) {
+    const filter = new ToolMarkupStreamFilter();
+    let out = filter.push(text.slice(0, cut));
+    out += filter.push(text.slice(cut));
+    out += filter.flushRest();
+    assert.ok(!out.includes('RESULT'), `split@${cut} 漏了 RESULT: ${JSON.stringify(out)}`);
+    assert.equal(squeeze(out), expected, `split@${cut} 内容不对: ${JSON.stringify(out)}`);
+  }
+});
+
+test('流式过滤器：半截段落标题（未写完）也先扣住', () => {
+  const text = '正常正文\n## ASSISTANT_ROLE_MESSAGES\n后面的正文';
+  for (let cut = 1; cut < text.length; cut += 1) {
+    const filter = new ToolMarkupStreamFilter();
+    let out = filter.push(text.slice(0, cut));
+    out += filter.push(text.slice(cut));
+    out += filter.flushRest();
+    assert.ok(!out.includes('ASSISTANT_ROLE'), `split@${cut} 漏了半截标题: ${JSON.stringify(out)}`);
+    assert.match(out, /正常正文/);
+    assert.match(out, /后面的正文/);
+  }
+});

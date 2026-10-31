@@ -1,0 +1,29 @@
+{
+  "name": "fuckds",
+  "version": "0.1.0",
+  "description": "把 chat.deepseek.com 网页对话包装成 OpenAI 兼容 API：Playwright 驱动浏览器，每条消息都是一次全新对话，上下文由 ## ROLE 段落拼接。",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bin": {
+    "fuckds": "bin/cli.mjs"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "dev": "node --watch src/index.mjs",
+    "auth": "node scripts/auth.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "test": "node --test --test-concurrency=1 'test/**/*.test.mjs'",
+    "setup:deps": "bash scripts/install-chromium-deps.sh",
+    "setup:browser": "playwright install chromium",
+    "up": "node scripts/server-ctl.mjs up",
+    "down": "node scripts/server-ctl.mjs down",
+    "status": "node scripts/server-ctl.mjs status",
+    "pow:build": "node scripts/build-pow.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.49.1"
+  }
+}
