@@ -44,10 +44,10 @@
 要求：Node.js ≥ 20.11 go ≧ 1.21。
 
 ```bash
-`npm instal`
+npm install
 安装 Go
-`sudo apt install golang`
-`npm run pow:build`
+sudo apt install golang
+npm run pow:build
 ```
 ### 1. 拿 userToken
 
