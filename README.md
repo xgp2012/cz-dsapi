@@ -1,6 +1,7 @@
 # fuckds
 
 [**官方tg频道**](https://t.me/xinglingdefuckds)
+
 把 **chat.deepseek.com 网页版** 包装成 **OpenAI / Anthropic 双协议兼容 API**。
 
 **⚠️严重警告，请勿在deepseek harness中使用，模型会不遵守约定输出明显的DSML原生工具调用token 极易导致账号被封禁！**
