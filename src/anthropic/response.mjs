@@ -7,10 +7,14 @@ export const newMessageId = () => `msg_${crypto.randomBytes(12).toString('hex')}
 /** 生成 tool_use 块 id；流式和非流式都用同一套规则，客户端回传后能对上 */
 export const toolUseId = (messageId, index) => `toolu_${String(messageId).slice(-12)}_${index}`;
 
-export function estimateMessageUsage(promptText, outputText) {
+/**
+ * 估算 Anthropic usage。output_tokens 必须包含 thinking token：
+ * Anthropic 官方把 thinking 也算进 output_tokens，少算会让客户端显示的 tok/s 偏低。
+ */
+export function estimateMessageUsage(promptText, outputText, reasoningText = '') {
   return {
     input_tokens: estimateTokens(promptText || ''),
-    output_tokens: estimateTokens(outputText || ''),
+    output_tokens: estimateTokens(outputText || '') + estimateTokens(reasoningText || ''),
   };
 }
 

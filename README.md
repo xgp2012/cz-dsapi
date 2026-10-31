@@ -255,8 +255,11 @@ npm run auth -- --list      # 查看号池（token 打码）
 
 - 请求按轮询分配账号，每个账号有自己的 PoW 缓存、会话池、设备 ID
 - 某个账号命中 `rate_limit_reached` → 标记冷却（`ACCOUNT_COOLDOWN_MS`，默认 60s）→ **立刻换下一个账号重试**，不等待
-- 池里全都冷却中：等待不超过 `MAX_COOLDOWN_WAIT_MS`（默认 5s），超过就返回 `429` + `Retry-After`
-- `GET /healthz` 里能看到每个账号的可用状态、剩余冷却、请求数
+- 某个账号登录态失效 / 上游报错 → **同一个请求里立刻换号重试**，并把坏号停用（登录态失效停用 24h，换 token 或重启后恢复）；
+  不会再出现「先撞一次坏号、要客户端重发才能换号，下一次又轮回到坏号」的情况
+- 池里全都冷却中：等待不超过 `MAX_COOLDOWN_WAIT_MS`（默认 5s），超过就返回 `429` + `Retry-After`；
+  如果全是登录态失效停用的号，直接返回 `503`（提示重新 auth）
+- `GET /healthz` 里能看到每个账号的可用状态、剩余冷却、请求数、最近一次失败原因（`lastError` / `authFailed`）
 
 > 直连不再做发送间隔（`DIRECT_SEND_INTERVAL_MS=0`）：既然限流是额度不是速率，放慢只会白白变慢。
 
@@ -386,7 +389,7 @@ DSML / `<tool_call>`，服务端会把它救回来（见下一节），但绝不
 | --- | --- |
 | 图片 `image_url` | ✅ 直连引擎支持（data URL / http） |
 | `stream` | ✅ 真流式 |
-| `stream_options.include_usage` | ✅ 末尾 usage（按字符估算） |
+| `stream_options.include_usage` | ✅ 末尾 usage（按字符估算；`completion_tokens` 含思考 token，和 OpenAI 口径一致，客户端 tok/s 不会虚低） |
 | `tools` / `tool_calls` | ✅ |
 | `reasoning_content` | ✅ 先于 `content` 输出 |
 | `temperature` / `top_p` / `max_tokens` / `stop` | ⚠️ 接受但忽略 |

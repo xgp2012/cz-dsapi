@@ -43,7 +43,7 @@ export function createAnthropicHandler({ config, log, runChat, sendJson }) {
         reasoning: result.reasoning,
         toolCalls: result.toolCalls,
         stopReason,
-        usage: estimateMessageUsage(result.prompt, result.text),
+        usage: estimateMessageUsage(result.prompt, result.text, result.reasoning),
       });
       log.info('完成（Anthropic）', {
         id,
@@ -167,7 +167,7 @@ export function createAnthropicHandler({ config, log, runChat, sendJson }) {
       }
 
       const stopReason = result.toolCalls.length ? 'tool_use' : 'end_turn';
-      const finalUsage = estimateMessageUsage(result.prompt, result.text);
+      const finalUsage = estimateMessageUsage(result.prompt, result.text, result.reasoning);
       sse.event('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: stopReason, stop_sequence: null },

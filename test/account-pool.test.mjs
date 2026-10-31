@@ -55,6 +55,43 @@ test('status 只暴露打码后的 token', () => {
   assert.match(info.token, /…/);
 });
 
+test('账号级失败会停用该账号，后续 pick 直接跳过（不需要客户端重发）', () => {
+  const p = pool(2);
+  const bad = p.pick();
+  p.markUnavailable(bad, 60_000, '登录态失效', { authFailed: true });
+
+  // 同一个进程里下一次 pick 就应该直接选另一个号
+  assert.equal(p.hasAvailable(), true);
+  assert.equal(p.pick().index, 1);
+  assert.equal(bad.authFailed, true);
+  assert.equal(bad.lastError, '登录态失效');
+  assert.equal(bad.errorCount, 1);
+});
+
+test('全部登录态失效：pick 返回 null，allAuthFailed 为真，status 带原因', () => {
+  const p = pool(2);
+  for (let i = 0; i < 2; i += 1) {
+    p.markUnavailable(p.pick(), 60_000, '登录态失效', { authFailed: true });
+  }
+  assert.equal(p.pick(), null);
+  assert.equal(p.allAuthFailed(), true);
+  const [first] = p.status();
+  assert.equal(first.available, false);
+  assert.equal(first.authFailed, true);
+  assert.match(first.lastError, /登录态失效/);
+});
+
+test('markHealthy 清掉停用状态', () => {
+  const p = pool(1);
+  const account = p.pick();
+  p.markUnavailable(account, 60_000, '上游报错');
+  p.markHealthy(account);
+  assert.equal(account.cooldownUntil, 0);
+  assert.equal(account.authFailed, false);
+  assert.equal(account.lastError, null);
+  assert.equal(p.pick(), account);
+});
+
 test('maskToken', () => {
   assert.equal(maskToken(''), '(空)');
   assert.equal(maskToken('short'), 'sho***');

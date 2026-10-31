@@ -83,6 +83,9 @@ export class PowSolver {
   close() {
     if (this.proc && !this.proc.killed) this.proc.kill();
     this.proc = null;
+    // 先 reject 掉在途请求：它们的 15s 超时定时器只有走 resolve/reject 包装才会被清掉，
+    // 否则进程退出（或测试结束）会被这些定时器拖住十几秒。
+    for (const { reject } of this.pending.values()) reject(new Error('PoW 求解器已关闭'));
     this.pending.clear();
   }
 }

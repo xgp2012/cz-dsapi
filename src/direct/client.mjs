@@ -22,6 +22,28 @@ const API_ERROR_MAX_RETRIES = 3;
 const API_ERROR_RETRY_DELAY_MS = 500;
 
 /**
+ * 登录态失效的账号停用多久（毫秒）。
+ *
+ * token 失效不会自己恢复，换 token / 重启进程之前都不该再选它；
+ * 这里用一个有限的大值（而不是 Infinity），保证 /healthz 的 cooldownMs 能正常序列化。
+ */
+export const AUTH_INVALID_COOLDOWN_MS = 24 * 60 * 60_000;
+
+/**
+ * 判断错误是否属于「这个账号此刻不能用」，可以在同一个请求里换号重试。
+ *
+ * 客户端断开（499）、超时、参数类错误都跟账号无关，直接抛给调用方；
+ * 限流、登录态失效、上游报错则先停用当前号再试下一个。
+ */
+export function isAccountScopedFailure(err) {
+  if (err instanceof RateLimitError || err instanceof AuthExpiredError) return true;
+  if (err instanceof UpstreamError) {
+    return !(err.status === 499 || err.code === 'client_closed');
+  }
+  return false;
+}
+
+/**
  * PoW header 缓存的安全余量（毫秒）。
  *
  * create_pow_challenge 返回的 challenge 带 expire_at：过期后服务端会拒收
@@ -153,6 +175,8 @@ export class DirectEngine {
         if (!account) {
           const wait = this.pool.nextAvailableAt() - now;
           if (wait > maxCooldownWaitMs) {
+            // 所有号都是登录态失效停用的：报登录态错误，别让调用方误以为是限流
+            if (this.pool.allAuthFailed()) throw new AuthExpiredError();
             throw new RateLimitError(
               `所有账号都在限流冷却中，约 ${Math.ceil(wait / 1000)}s 后恢复（可往号池加 token）`,
               { retryAfterMs: wait },
@@ -169,26 +193,53 @@ export class DirectEngine {
           this.pool.markHealthy(account);
           return result;
         } catch (err) {
-          if (!(err instanceof RateLimitError)) throw err;
+          if (signal?.aborted) throw err;
+          // 客户端断开 / 超时 / 参数问题：跟账号无关，直接抛
+          if (!isAccountScopedFailure(err)) throw err;
 
-          const cooldown = Math.max(rateLimitBackoffMs, accountCooldownMs);
-          this.pool.markLimited(account, cooldown);
-
-          // 池里还有别的账号：立刻换，不等待
-          if (this.pool.pick() && attempt < maxAttempts) continue;
-
-          if (this.pool.size > 1 && attempt < maxAttempts) {
-            const wait = this.pool.nextAvailableAt() - Date.now();
-            if (wait <= maxCooldownWaitMs) {
-              await sleep(Math.max(0, wait), signal).catch(() => {});
-              continue;
-            }
+          // 账号级失败：先停用当前号，再在同一个请求里换号重试。
+          // 不能把失败抛回客户端等它重发——那样下一次轮询又会先撞回这个坏号。
+          // 但如果这一轮已经把部分正文/思考流给客户端了，就不能换号重放（会重复），只能抛。
+          const partialOutput = Boolean(err.partialOutput);
+          let retryAfterMs;
+          if (err instanceof RateLimitError) {
+            retryAfterMs = Math.max(rateLimitBackoffMs, accountCooldownMs);
+            this.pool.markLimited(account, retryAfterMs);
+          } else if (err instanceof AuthExpiredError) {
+            retryAfterMs = AUTH_INVALID_COOLDOWN_MS;
+            this.pool.markUnavailable(account, retryAfterMs, '登录态失效', { authFailed: true });
+          } else if (this.pool.size > 1) {
+            // 上游报错/人机验证：有别的号就轮换，没有别的号就别把自己锁死
+            retryAfterMs = Math.max(1000, accountCooldownMs);
+            this.pool.markUnavailable(account, retryAfterMs, err.message || '账号不可用');
+          } else {
+            throw err;
           }
 
-          throw new RateLimitError(
-            this.pool.size > 1 ? '号池里的账号都被限流了，稍后重试或再加 token' : err.message,
-            { retryAfterMs: Math.max(1000, this.pool.nextAvailableAt() - Date.now()) },
-          );
+          if (partialOutput) throw err;
+          if (attempt >= maxAttempts) throw err;
+          // 池里还有别的号：立刻换，不等待
+          if (this.pool.hasAvailable()) continue;
+
+          // 其它号都在冷却：短时间内能恢复就等一下，否则直接抛
+          const wait = this.pool.nextAvailableAt() - Date.now();
+          if (this.pool.size > 1 && wait <= maxCooldownWaitMs) {
+            await sleep(Math.max(0, wait), signal).catch(() => {});
+            continue;
+          }
+          if (this.pool.size > 1) {
+            if (this.pool.allAuthFailed()) throw new AuthExpiredError();
+            if (err instanceof RateLimitError) {
+              throw new RateLimitError('号池里的账号都被限流了，稍后重试或再加 token', {
+                retryAfterMs: Math.max(1000, wait),
+              });
+            }
+            throw err;
+          }
+          if (err instanceof RateLimitError) {
+            throw new RateLimitError(err.message, { retryAfterMs: Math.max(1000, retryAfterMs) });
+          }
+          throw err;
         }
       }
       throw new RateLimitError('暂时没有可用账号');
@@ -358,6 +409,10 @@ export class DirectEngine {
           }
           if (timedOut || err instanceof TimeoutError) {
             throw new TimeoutError(`等待 DeepSeek 响应超时（${Math.round(timeoutMs / 1000)}s）`);
+          }
+          // 已经流出一部分正文/思考：换号重放会让客户端看到重复内容，外层据此不再重试
+          if (err && typeof err === 'object' && (emittedContent || emittedReasoning)) {
+            err.partialOutput = true;
           }
           throw err;
         }

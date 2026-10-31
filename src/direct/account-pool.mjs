@@ -22,6 +22,10 @@ export class AccountPool {
       sessionPool: [],
       cooldownUntil: 0,
       limitedCount: 0,
+      errorCount: 0,
+      lastError: null,
+      /** 登录态失效：换 token / 重启进程之前这个号不会再被选中 */
+      authFailed: false,
       lastUsedAt: 0,
       requests: 0,
     }));
@@ -53,9 +57,20 @@ export class AccountPool {
     return Math.min(...this.accounts.map((a) => a.cooldownUntil));
   }
 
+  /** 池里还有没有立刻能用的账号（只看状态，不消耗轮询游标） */
+  hasAvailable(now = Date.now()) {
+    return this.accounts.some((a) => a.cooldownUntil <= now);
+  }
+
+  /** 是否所有账号都因为登录态失效被停用 */
+  allAuthFailed() {
+    return this.accounts.length > 0 && this.accounts.every((a) => a.authFailed);
+  }
+
   markLimited(account, ms) {
-    account.cooldownUntil = Date.now() + ms;
+    account.cooldownUntil = Math.max(account.cooldownUntil, Date.now() + ms);
     account.limitedCount += 1;
+    account.lastError = '触发限流';
     const seconds = Math.round(ms / 100) / 10;
     this.log.warn(
       `账号 #${account.index + 1} 触发限流，冷却 ${seconds}s（池内还有 ${
@@ -64,8 +79,27 @@ export class AccountPool {
     );
   }
 
+  /**
+   * 账号级失败（登录态失效 / 上游报错）导致的停用。
+   * 冷却期内这个号不会被选中，避免每次请求先撞一次坏号、要靠客户端重发才能换号。
+   */
+  markUnavailable(account, ms, reason, { authFailed = false } = {}) {
+    account.cooldownUntil = Math.max(account.cooldownUntil, Date.now() + ms);
+    account.errorCount += 1;
+    account.lastError = reason;
+    if (authFailed) account.authFailed = true;
+    const seconds = Math.round(ms / 100) / 10;
+    this.log.warn(
+      `账号 #${account.index + 1} 不可用（${reason}），停用 ${seconds}s（池内还有 ${
+        this.accounts.filter((a) => a !== account && a.cooldownUntil <= Date.now()).length
+      } 个可用）`,
+    );
+  }
+
   markHealthy(account) {
     account.cooldownUntil = 0;
+    account.authFailed = false;
+    account.lastError = null;
   }
 
   status() {
@@ -77,6 +111,9 @@ export class AccountPool {
       cooldownMs: Math.max(0, a.cooldownUntil - now),
       requests: a.requests,
       limited: a.limitedCount,
+      errors: a.errorCount,
+      lastError: a.lastError,
+      authFailed: a.authFailed,
       powReady: Boolean(a.powNext),
       sessionsReady: a.sessionPool.length,
     }));

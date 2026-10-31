@@ -160,7 +160,7 @@ export function createServer({ config, logger, web }) {
         reasoning: result.reasoning || undefined,
         toolCalls: result.toolCalls,
         finishReason: result.toolCalls.length ? 'tool_calls' : 'stop',
-        usage: estimateUsage(result.prompt, result.content),
+        usage: estimateUsage(result.prompt, result.text, result.reasoning),
       });
       log.info('完成', {
         id,
@@ -275,7 +275,7 @@ export function createServer({ config, logger, web }) {
           created: Math.floor(Date.now() / 1000),
           model: request.model,
           choices: [],
-          usage: estimateUsage(result.prompt, result.text),
+          usage: estimateUsage(result.prompt, result.text, result.reasoning),
         });
       }
 
@@ -316,7 +316,7 @@ export function createServer({ config, logger, web }) {
         created: Math.floor(Date.now() / 1000),
         model: request.model,
         choices: [{ index: 0, text: result.content, finish_reason: 'stop' }],
-        usage: estimateUsage(result.prompt, result.content),
+        usage: estimateUsage(result.prompt, result.text, result.reasoning),
       });
     }
     const sse = new SseWriter(res);
