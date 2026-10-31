@@ -302,7 +302,7 @@ DSML / `<tool_call>`，服务端会把它救回来（见下一节），但绝不
 网页版模型有个坏习惯：看到 `RESULT` 就自己往后编一段「执行结果」，再把答案建立在这段假结果上。
 这里做了四层处理：
 
-1. **协议上隔离**：`RESULT` 只出现在 `## TOOL_RESULT_MESSAGES:` 段，system 段明确写「你绝对不能输出 RESULT」；
+1. **协议上隔离**：`RESULT` 只出现在 `< || TOOL_RESULT_MESSAGES | | >:` 段，system 段明确写「你绝对不能输出 RESULT」；
 2. **识别放宽**：不只认行首 `RESULT:`，`**RESULT:**`、`RESULT：`（全角冒号）、`result:`（小写）、
    `- RESULT:`、`` ``` `` 代码块里的、以及行内 `结果：RESULT:{...}` 都会被识别；
 3. **出口清洗**：命中的内容从 `content` 和 SSE 增量里剔除，顺带清掉只剩空壳的代码块；
