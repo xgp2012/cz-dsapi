@@ -43,8 +43,7 @@
 
 ```bash
 npm install
-`安装 Go
-**如果你是ubuntu系统：**
+`安装 Go`
 `sudo apt install golang`
 `npm run pow:build`
 ```
