@@ -43,13 +43,11 @@
 
 ```bash
 npm install
-npx playwright install chromium   #browser 引擎需要 Chromium
-# 无 root 缺库时：npm run setup:deps
+`安装 Go
+**如果你是ubuntu系统：**
+`sudo apt install golang`
+`npm run pow:build`
 ```
-
-> 想换成更快的直连引擎：装 Go 1.21+ 后 `npm run pow:build`，再设 `ENGINE=direct`（或 `ENGINE=auto`）。
-> 浏览器引擎不支持图片输入和超长上下文转附件，需要这些能力时用 `ENGINE=direct`。
-
 ### 1. 拿 userToken
 
 1. 浏览器打开 <https://chat.deepseek.com> 并登录
