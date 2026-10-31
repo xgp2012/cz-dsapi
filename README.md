@@ -54,6 +54,7 @@ npm install
 3. 键 `userToken`，值是 `{"value":"xxxxx","__version":"0"}`，复制 `value`
 
 **或者**
+
 直接在控制台敲：
 ```javascript
 copy(JSON.parse(localStorage.getItem("userToken").value))
