@@ -41,11 +41,11 @@
 
 ## 快速开始
 
-要求：Node.js ≥ 20.11。
+要求：Node.js ≥ 20.11 go ≧ 1.21。
 
 ```bash
-npm install
-`安装 Go`
+`npm instal`
+安装 Go
 `sudo apt install golang`
 `npm run pow:build`
 ```
