@@ -4,11 +4,9 @@
 
 把 **chat.deepseek.com 网页版** 包装成 **OpenAI / Anthropic 双协议兼容 API**。
 
-**⚠️严重警告，请勿在deepseek harness中使用，模型会不遵守约定输出明显的DSML原生工具调用token 极易导致账号被封禁！**
-
 **与其他项目不同，因为没有明显的工具调用特征，实测按照提示使用此项目个人使用无封号/禁言问题**
 
-上下文不打在服务端：每条请求都把历史按 `SYSTEM_ROLE_MESSAGES` / ` USER_ROLE_MESSAGES` / `ASSISTANT_ROLE_MESSAGES` 的段落格式拼成一条 prompt，作为一次**全新对话**发给模型。
+上下文不打在服务端：每条请求都把历史按 `SYSTEM_ROLE_MESSAGES` / `USER_ROLE_MESSAGES` / `ASSISTANT_ROLE_MESSAGES` 的段落格式拼成一条 prompt，作为一次**全新对话**发给模型。客户端内容（system / 工具声明 / 对话历史）全部排在前面，自带的协议提示词拼在最后。
 
 两种引擎，默认 **direct**（Playwright 驱动真实网页）：
 
@@ -262,7 +260,32 @@ npm run auth -- --list      # 查看号池（token 打码）
 
 > 直连不再做发送间隔（`DIRECT_SEND_INTERVAL_MS=0`）：既然限流是额度不是速率，放慢只会白白变慢。
 
-**工具结果单独成段**（`## TOOL_RESULT_MESSAGES:`），不会并进 `ASSISTANT_ROLE_MESSAGES`。
+## prompt 拼接顺序
+
+一次请求 = 一次全新的网页对话，模型只能靠拼出来的这一条 prompt 判断上下文。拼接顺序固定为
+**客户端内容在前、自带的协议提示词在最后**：
+
+```
+MESSAGES:
+SYSTEM_ROLE_MESSAGES:
+  …客户端传入的 system / 额外约束…
+TOOL_FUNCTIONS:
+  …工具声明（每行一个 JSON）…
+USER_ROLE_MESSAGES:
+  …对话历史，直到最后一问…
+ASSISTANT_ROLE_MESSAGES:
+  …模型历史回答…
+TOOL_CALL_RESULT:
+  …工具结果…
+SYSTEM_ROLE_MESSAGES:
+  …自带的特殊 token 声明 / DO 规范 / 工具结果约束（拼在最后）…
+```
+
+- 客户端传入的 **system、工具声明、对话历史全部排在前面**；
+- 自带的协议提示词（`SPECIAL_TOKENS_HEADER`）拼在整条 prompt 的 **最末尾**，模型最后读到的是格式规范；
+- 不再额外追加「注意力引导」等重复约束，末尾的协议声明已经承担这个作用。
+
+**工具结果单独成段**（`<|TOOL_CALL_RESULT|>`），不会并进 `ASSISTANT_ROLE_MESSAGES`。
 这是关键：模型是照着自己段落里的写法往后接的，只要 `RESULT` 从不以「assistant 说过的话」的形式出现，
 它就没有可模仿的样板。最后一段是工具结果时，段尾还会补一句「直接回答」把话头收回来。
 
@@ -319,7 +342,7 @@ DSML / `<tool_call>`，服务端会把它救回来（见下一节），但绝不
 正文（≤ MAX_PROMPT_CHARS）：     附件（.txt）：
 # MESSAGES:                      # 对话历史（较早部分）
 ## SYSTEM_ROLE_MESSAGES          ## USER_ROLE_MESSAGES:
-  …特殊 token 声明…                （较早的对话）
+  …客户端 system…                  （较早的对话）
 ## TOOL_FUNCTIONS:               ## ASSISTANT_ROLE_MESSAGES:
   …工具声明…                       …
 ## CONTEXT_ATTACHMENT:
@@ -327,12 +350,14 @@ DSML / `<tool_call>`，服务端会把它救回来（见下一节），但绝不
   context-53772c8f.txt 上传…
 ## USER_ROLE_MESSAGES:
   （最近的段落，直到最后一问）
+## SYSTEM_ROLE_MESSAGES:
+  …特殊 token 声明（拼在最后）…
 ```
 
 规则：
 
 - 只切在 `## USER_ROLE_MESSAGES` / `## ASSISTANT_ROLE_MESSAGES` / `## TOOL_RESULT_MESSAGES` 段落边界，不切碎单条消息；
-- **保留最新的段落**（要回答的问题在最后），较早的进附件；system 段和工具声明永远留在正文；
+- **保留最新的段落**（要回答的问题在最后），较早的进附件；客户端 system 段和工具声明永远留在正文，自带的协议提示词固定在正文末尾；
 - 最后一段自己就超长（比如读了一个大文件）时，保留它的尾部，前面部分进附件；
 - 附件按内容 hash 缓存 30 分钟，同样内容不会重复上传；上传一次约多 0.3~1s；
 - 正文里会带一段 `## CONTEXT_ATTACHMENT:` 说明，要求模型先读附件再回答。

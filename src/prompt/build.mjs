@@ -1,6 +1,6 @@
 import { ApiError } from '../errors.mjs';
 import { contentToText } from '../util.mjs';
-import { FINAL_ANSWER_HINT, PROMPT_HEADER, SECTION, SPECIAL_TOKENS_HEADER, TOOL_CALL_REMINDER } from './special.mjs';
+import { FINAL_ANSWER_HINT, PROMPT_HEADER, SECTION, SPECIAL_TOKENS_HEADER } from './special.mjs';
 import { collectToolNames, renderToolDeclarations, renderToolResult } from './tools.mjs';
 
 const VALID_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool', 'function']);
@@ -10,24 +10,30 @@ const VALID_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool',
  *
  * 输出形状（一次请求 = 一次全新对话，模型只能靠这些段落判断上下文）：
  *
- *   # MESSAGES:
- *   ## SYSTEM_ROLE_MESSAGES
- *   <特殊 token 声明 + 调用方传入的 system + 工具格式重申>
+ *   MESSAGES:
+ *   SYSTEM_ROLE_MESSAGES:
+ *   <调用方传入的 system（客户端 prompt 置前）>
  *
- *   ## TOOL_FUNCTIONS:
+ *   TOOL_FUNCTIONS:
  *   {"name":"exec_shell","description":"..."}
  *
- *   ## USER_ROLE_MESSAGES:
+ *   USER_ROLE_MESSAGES:
  *   你好
  *
- *   ## ASSISTANT_ROLE_MESSAGES:
+ *   ASSISTANT_ROLE_MESSAGES:
  *   你好！有什么可以帮你？
  *
- *   ## <|TOOL_CALL_RESULT|>:
+ *   TOOL_CALL_RESULT:
  *   RESULT:{"name":"exec_shell","result":"Linux"}
  *
- *   ## USER_ROLE_MESSAGES:
+ *   USER_ROLE_MESSAGES:
  *   解释一下
+ *
+ *   SYSTEM_ROLE_MESSAGES:
+ *   <自带的特殊 token 声明 / DO 规范（拼在最后）>
+ *
+ * 客户端内容（system、工具声明、对话历史）全部在前，自带的协议提示词拼在整条
+ * prompt 的最末尾，模型最后读到的就是格式规范。
  *
  * 注意工具结果的归属：它**单独成段**，不塞进 ASSISTANT_ROLE_MESSAGES。
  * 模型看到的历史里，自己的段落永远只有正文和 DO 调用行，不会出现 RESULT，
@@ -86,18 +92,15 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
 
   const lastSection = sections.at(-1);
   if (lastSection?.role === 'toolResult') {
-    // 提示放在结果段末尾：模型接着往下写时，最后看到的是「现在该直接回答」
+    // 最后一段是工具结果时，段尾补一句「直接回答」，把话头收回来
     lastSection.lines.push('', FINAL_ANSWER_HINT);
   }
 
-  const parts = [PROMPT_HEADER, SECTION.system, SPECIAL_TOKENS_HEADER.trimEnd()];
+  // 客户端 prompt 置前：调用方传入的 system（含「额外约束」）→ 工具声明 → 对话历史
   const extra = typeof systemExtra === 'string' ? systemExtra.trim() : '';
-  if (systemTexts.length || extra) {
-    // 调用方的 system 与「额外约束」都放在协议声明之后，越靠后约束力越强
-    parts.push('', [...systemTexts, extra].filter(Boolean).join('\n\n'));
-  }
-  // 客户端 SYSTEM prompt 的末尾：长上下文时重申只认 DO: 格式，把注意力拉回开头协议
-  parts.push('', TOOL_CALL_REMINDER);
+  const parts = [PROMPT_HEADER, SECTION.system];
+  const systemBody = [...systemTexts, extra].filter(Boolean).join('\n\n');
+  if (systemBody) parts.push(systemBody);
 
   const toolLines = renderToolDeclarations(tools);
   if (toolLines.length) {
@@ -108,6 +111,9 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
     const body = section.lines.join('\n').trim();
     parts.push('', SECTION[section.role], body);
   }
+
+  // 自带的协议提示词拼到最后：以上全是客户端内容，模型最后读到的是格式规范
+  parts.push('', SECTION.system, SPECIAL_TOKENS_HEADER.trimEnd());
 
   const prompt = parts.join('\n').trimEnd();
 
