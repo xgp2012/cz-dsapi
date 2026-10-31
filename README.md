@@ -1,9 +1,11 @@
 # fuckds
 
 把 **chat.deepseek.com 网页版** 包装成 **OpenAI / Anthropic 双协议兼容 API**。
+
 **⚠️严重警告，请勿在deepseek harness中使用，模型会不遵守约定输出明显的DSML原生工具调用token 极易导致账号被封禁！**
 
 **与其他项目不同，因为没有明显的工具调用特征，实测按照提示使用此项目个人使用无封号/禁言问题**
+
 上下文不打在服务端：每条请求都把历史按 `SYSTEM_ROLE_MESSAGES` / ` USER_ROLE_MESSAGES` / `ASSISTANT_ROLE_MESSAGES` 的段落格式拼成一条 prompt，作为一次**全新对话**发给模型。
 
 两种引擎，默认 **direct**（Playwright 驱动真实网页）：
