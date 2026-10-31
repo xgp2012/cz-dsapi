@@ -260,46 +260,9 @@ npm run auth -- --list      # 查看号池（token 打码）
 
 > 直连不再做发送间隔（`DIRECT_SEND_INTERVAL_MS=0`）：既然限流是额度不是速率，放慢只会白白变慢。
 
-## Prompt 协议
-
-完整示例见 [examples/prompt-example.md](examples/prompt-example.md)。
-
-```
-# MESSAGES:
-## SYSTEM_ROLE_MESSAGES
-特殊 token 声明：…（SYSTEM/USER/ASSISTANT/DO/TOOL_FUNCTIONS/TOOL_RESULT 约定 + 禁止自造结果）
-
-<客户端传入的 system>
-
-## TOOL_FUNCTIONS:
-{"name":"exec_shell","description":"Exec shell command","parameters":{...}}
-
-## USER_ROLE_MESSAGES:
-你好
-
-## ASSISTANT_ROLE_MESSAGES:
-你好！有什么可以帮你？
-
-## USER_ROLE_MESSAGES:
-看看内核
-
-## ASSISTANT_ROLE_MESSAGES:
-DO:{"name":"exec_shell","args":{"command":"uname -a"}}
-
-## TOOL_RESULT_MESSAGES:
-RESULT:{"name":"exec_shell","result":"Linux ubuntu 6.1"}
-
-（系统提示：以上结果由系统注入，请直接据此回答用户。不要输出 RESULT，也不要编造或重复调用同一个工具。）
-```
-
 **工具结果单独成段**（`## TOOL_RESULT_MESSAGES:`），不会并进 `ASSISTANT_ROLE_MESSAGES`。
 这是关键：模型是照着自己段落里的写法往后接的，只要 `RESULT` 从不以「assistant 说过的话」的形式出现，
 它就没有可模仿的样板。最后一段是工具结果时，段尾还会补一句「直接回答」把话头收回来。
-
-> 旧版本把 `RESULT:{...}` 直接塞进 assistant 段落，等于手把手教模型「assistant 写完调用就该自己写 RESULT」，
-> 这是自造结果的主要来源。
-
----
 
 ## 工具调用
 
