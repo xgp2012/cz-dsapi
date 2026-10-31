@@ -52,7 +52,8 @@ npm install
 1. 浏览器打开 <https://chat.deepseek.com> 并登录
 2. `F12` → **Application** → **Local Storage** → `https://chat.deepseek.com`
 3. 键 `userToken`，值是 `{"value":"xxxxx","__version":"0"}`，复制 `value`
-**or**
+
+**或者**
 直接在控制台敲：
 ```javascript
 copy(JSON.parse(localStorage.getItem("userToken").value))
