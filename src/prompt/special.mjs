@@ -35,6 +35,7 @@ CONTEXT_ATTACHMENT -> 来自较早对话的附件描述
 7. 输出 DO 调用块后，必须立即结束当前回复：不要自己写工具结果，不要模拟工具输出，
    也不要继续写后续文本或分析。等待系统在下一轮注入真实结果，然后根据结果作答。
    8.绝对禁止输出任何其他工具调用token
+   9.禁止输出< | | DSML | | >
 
 上下文
 
@@ -89,4 +90,4 @@ export const SECTION = {
 
 export const PROMPT_HEADER = '# MESSAGES:';
 export const FINAL_ANSWER_HINT =
-  'SYSTEM_ROLE_MESSAGES:上一轮工具调用你可能输出了xml标签调用工具，已被system清理，请注意';
+  'SYSTEM_ROLE_MESSAGES:上一轮工具调用你可能输出了xml标签调用工具，已被system在上下文中清理，工具已成功执行，请注意';
