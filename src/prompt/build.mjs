@@ -12,7 +12,9 @@ const VALID_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool',
  *
  *   MESSAGES:
  *   SYSTEM_ROLE_MESSAGES:
- *   <调用方传入的 system（客户端 prompt 置前）>
+ *   <调用方传入的 system（客户端 prompt 最上面）>
+ *
+ *   <自带的特殊 token 声明 / DO 规范（放中间）>
  *
  *   TOOL_FUNCTIONS:
  *   {"name":"exec_shell","description":"..."}
@@ -29,11 +31,7 @@ const VALID_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool',
  *   USER_ROLE_MESSAGES:
  *   解释一下
  *
- *   SYSTEM_ROLE_MESSAGES:
- *   <自带的特殊 token 声明 / DO 规范（拼在最后）>
- *
- * 客户端内容（system、工具声明、对话历史）全部在前，自带的协议提示词拼在整条
- * prompt 的最末尾，模型最后读到的就是格式规范。
+ * 顺序：客户端 system 在最上面，自带协议提示词夹在中间，工具声明和对话历史（user）在后面。
  *
  * 注意工具结果的归属：它**单独成段**，不塞进 ASSISTANT_ROLE_MESSAGES。
  * 模型看到的历史里，自己的段落永远只有正文和 DO 调用行，不会出现 RESULT，
@@ -96,11 +94,14 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
     lastSection.lines.push('', FINAL_ANSWER_HINT);
   }
 
-  // 客户端 prompt 置前：调用方传入的 system（含「额外约束」）→ 工具声明 → 对话历史
+  // 顺序：客户端 system 最上面 → 自带协议提示词放中间 → 工具声明 → 对话历史（user 在最后）
   const extra = typeof systemExtra === 'string' ? systemExtra.trim() : '';
   const parts = [PROMPT_HEADER, SECTION.system];
   const systemBody = [...systemTexts, extra].filter(Boolean).join('\n\n');
   if (systemBody) parts.push(systemBody);
+
+  // 自带的协议提示词放中间：夹在客户端 system 和工具声明/对话历史之间
+  parts.push('', SPECIAL_TOKENS_HEADER.trim());
 
   const toolLines = renderToolDeclarations(tools);
   if (toolLines.length) {
@@ -111,9 +112,6 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
     const body = section.lines.join('\n').trim();
     parts.push('', SECTION[section.role], body);
   }
-
-  // 自带的协议提示词拼到最后：以上全是客户端内容，模型最后读到的是格式规范
-  parts.push('', SECTION.system, SPECIAL_TOKENS_HEADER.trimEnd());
 
   const prompt = parts.join('\n').trimEnd();
 

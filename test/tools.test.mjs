@@ -99,6 +99,35 @@ test('normalizeArguments: 非 JSON 字符串会被包一层', () => {
   assert.deepEqual(JSON.parse(normalizeArguments({ a: 1 })), { a: 1 });
 });
 
+test('parse: 被包成 {name,args} 的参数会自动拆开', () => {
+  // DO 里再套一层包装对象
+  const doCalls = parseToolCalls(
+    'DO:{"name":"bash","args":{"name":"bash","args":{"description":"show cwd","command":"pwd"}}}',
+    ['bash'],
+  );
+  assert.equal(doCalls.length, 1);
+  assert.deepEqual(JSON.parse(doCalls[0].arguments), { description: 'show cwd', command: 'pwd' });
+
+  // DO 里包装对象的 args 是 JSON 字符串
+  const doString = parseToolCalls(
+    'DO:{"name":"bash","args":{"name":"bash","args":"{\\"description\\":\\"show cwd\\",\\"command\\":\\"pwd\\"}"}}',
+    ['bash'],
+  );
+  assert.deepEqual(JSON.parse(doString[0].arguments), { description: 'show cwd', command: 'pwd' });
+});
+
+test('parse: DSML 参数被命名成 name/args 时也能救回', () => {
+  const text = `<｜DSML｜calls>
+<｜DSML｜invoke name="bash">
+<｜DSML｜parameter name="name" string="true">bash</｜DSML｜parameter>
+<｜DSML｜parameter name="args" string="true">{"description":"show cwd","command":"pwd"}</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜calls>`;
+  const calls = parseToolCalls(text, ['bash']);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(JSON.parse(calls[0].arguments), { description: 'show cwd', command: 'pwd' });
+});
+
 test('collectToolNames: 去空去重入参', () => {
   assert.deepEqual(
     collectToolNames([{ function: { name: 'a' } }, { function: { name: 'a' } }, { function: {} }, null]),

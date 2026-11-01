@@ -272,6 +272,8 @@ export class DirectEngine {
 
     let powRetried = false;
     let apiRetries = 0;
+    /** 空流重试次数：限流时接口经常只回一个空的 event: ready，先短等重试几次再判定为限流 */
+    let emptyRetries = 0;
     for (;;) {
       const controller = new AbortController();
       const onAbort = () => controller.abort(signal?.reason);
@@ -422,7 +424,18 @@ export class DirectEngine {
         }
 
         if (!emittedContent && !emittedReasoning) {
-          // 被限流时接口常常只回一个空的 event: ready
+          // 被限流时接口常常只回一个空的 event: ready。先短等重试几次：
+          // 不少空流只是瞬时抖动，直接抛 429 会让 agent 的工具调用轮次「丢流」失败。
+          if (emptyRetries < 2) {
+            emptyRetries += 1;
+            powHeader = null; // PoW 是一次性的，重试前必须换新的
+            const waitMs = 700 * emptyRetries;
+            this.log.warn(
+              `账号 #${account.index + 1} 收到空流，${waitMs}ms 后重试（${emptyRetries}/2）`,
+            );
+            await sleep(waitMs, signal).catch(() => {});
+            continue;
+          }
           throw new RateLimitError('网页接口没有返回内容（多半是消息发得太频繁，被限流）');
         }
 

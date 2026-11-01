@@ -274,10 +274,11 @@ export function parseToolCalls(text, knownTools = null) {
   const add = (name, args, raw, index) => {
     if (!name) return;
     if (allowed && !allowed.has(name)) return;
-    const signature = `${name}\u0000${canonicalArguments(args)}`;
+    const argsJson = normalizeArguments(args);
+    const signature = `${name}\u0000${canonicalArguments(argsJson)}`;
     if (seen.has(signature)) return;
     seen.add(signature);
-    calls.push({ name, arguments: args, raw, index });
+    calls.push({ name, arguments: argsJson, raw, index });
   };
 
   // 1) DO：唯一对外协议
@@ -287,7 +288,7 @@ export function parseToolCalls(text, knownTools = null) {
     const raw = readJsonObject(text, match.index + match[0].length);
     const call = raw ? normalizeCallObject(parseJsonLoose(raw)) : null;
     if (!call) continue;
-    add(call.name, normalizeArguments(call.args), `DO:${raw}`, match.index);
+    add(call.name, call.args, `DO:${raw}`, match.index);
   }
 
   // 2) DSML：模型原生吐出的 XML 风格调用（全角 / 半角竖线、截断都能救）
@@ -301,7 +302,7 @@ export function parseToolCalls(text, knownTools = null) {
   while ((xml = XML_TOOL_PATTERN.exec(text)) !== null) {
     const call = parseToolCallBody(xml[1]);
     if (!call) continue;
-    add(call.name, normalizeArguments(call.args), xml[0], xml.index);
+    add(call.name, call.args, xml[0], xml.index);
   }
 
   // 4) 原生工具 token（<|tool▁calls▁begin|> 之类）最后兜底
@@ -310,20 +311,54 @@ export function parseToolCalls(text, knownTools = null) {
   return calls.sort((a, b) => a.index - b.index);
 }
 
+/**
+ * 有些模型在原生格式（DSML / <tool_call> / 原生 token）里会把 DO 的包装对象原样塞进参数：
+ *
+ *   {"name":"bash","args":{"description":"...","command":"..."}}
+ *   {"name":"bash","args":"{\"description\":...,\"command\":...}"}
+ *
+ * 上层拿到的应该是真正的参数对象，而不是这层包装。这里只在「键正好是 name + args/arguments」
+ * 时才拆，避免误伤本来就有 name / args 字段的工具。
+ */
+export function unwrapCallArguments(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const keys = Object.keys(value);
+  if (!keys.every((key) => key === 'name' || key === 'args' || key === 'arguments')) return value;
+  if (typeof value.name !== 'string' || !value.name.trim()) return value;
+  if (!('args' in value) && !('arguments' in value)) return value;
+
+  let inner = 'args' in value ? value.args : value.arguments;
+  if (typeof inner === 'string') {
+    const trimmed = inner.trim();
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return value;
+    try {
+      inner = JSON.parse(trimmed);
+    } catch {
+      return value;
+    }
+  }
+  if (!inner || typeof inner !== 'object' || Array.isArray(inner)) return value;
+  return inner;
+}
+
+/**
+ * 工具调用的参数统一成 JSON 字符串（给 OpenAI tool_calls.arguments 用）。
+ * 兼容字符串 / 对象；被包装成 {name,args} 的会先拆掉（见 unwrapCallArguments）。
+ */
 export function normalizeArguments(args) {
-  if (typeof args === 'string') {
-    const trimmed = args.trim();
+  if (args === undefined || args === null) return '{}';
+  let value = args;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
     if (!trimmed) return '{}';
     try {
-      JSON.parse(trimmed);
-      return trimmed;
+      value = JSON.parse(trimmed);
     } catch {
       // 不是合法 JSON 就包一层，避免下游解析炸掉
       return JSON.stringify({ input: args });
     }
   }
-  if (args && typeof args === 'object') return JSON.stringify(args);
-  return '{}';
+  return JSON.stringify(unwrapCallArguments(value));
 }
 
 /**
