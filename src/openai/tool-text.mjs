@@ -46,6 +46,42 @@ function consumeLineBreak(text, index) {
 const NATIVE_TOOL_TOKEN = /<[ \t]*\|[^|<>\r\n]{0,64}tool[^|<>\r\n]{0,64}\|[ \t]*>/gi;
 
 /**
+ * 自带的结束标记 `<|END|>`（也认全角竖线 / 双层竖线 / 带空格的写法）。
+ *
+ * 提示词里要求模型「每轮完成后输出 <|END|>」，但它是完整的特殊 token，绝不能漏进正文。
+ * 只删 token 本身，不删它后面的正文（正常回答/工具调用常跟在后面）。
+ */
+const END_TOKEN = /<[ \t]*[|｜][ \t]*(?:[|｜][ \t]*)?END[ \t]*(?:[|｜][ \t]*){1,2}[ \t]*>/gi;
+
+/** 找出 `<|END|>` 标记，作为 SECTION 类协议块（正文清洗时剔除） */
+export function findEndTokenBlocks(text) {
+  if (!text) return [];
+  END_TOKEN.lastIndex = 0;
+  const blocks = [];
+  let match;
+  while ((match = END_TOKEN.exec(text)) !== null) {
+    blocks.push({ kind: 'SECTION', marker: 'END', start: match.index, end: match.index + match[0].length });
+  }
+  return blocks;
+}
+
+/**
+ * 半截的 `<|END` 标签（流式还没吐完）起点；没有则返回 -1。
+ * 只认从 `<` 到结尾都还是合法前缀的情况，避免误扣正常正文里的 `<`。
+ */
+export function findPendingEndToken(text, from = 0) {
+  if (!text) return -1;
+  const lt = text.lastIndexOf('<');
+  if (lt < Math.max(0, from)) return -1;
+  const tail = text.slice(lt);
+  if (tail.length > 48) return -1;
+  if (!/^<[ \t]*[|｜][ \t]*(?:[|｜][ \t]*)?(?:E(?:N(?:D)?)?)?[ \t]*[|｜]?[ \t]*$/.test(tail)) return -1;
+  // 已经写完的 <|END|> 交给 findEndTokenBlocks 处理，这里只扣没写完的
+  if (/^<[ \t]*[|｜][ \t]*(?:[|｜][ \t]*)?END[ \t]*(?:[|｜][ \t]*){1,2}[ \t]*>$/i.test(tail)) return -1;
+  return lt;
+}
+
+/**
  * 找出原生工具 token 块。
  * 一次原生调用通常是 `<|tool▁calls▁begin|><|tool▁call▁begin|>…参数 JSON…<|tool▁call▁end|><|tool▁calls▁end|>`，
  * 所以取「首个 token → 末个 token」作为协议区；若 JSON 落在末尾 token 之后，再把它一起吃掉。
@@ -104,6 +140,12 @@ export function findToolMarkup(text) {
 
   // 模型伪造的上下文段标题（## USER_ROLE_MESSAGES 之类）
   for (const block of findSectionBlocks(text)) {
+    if (covered(blocks, block.start)) continue;
+    blocks.push(block);
+  }
+
+  // 自带的结束标记 <|END|>：整块剔除（只删 token，不删后面的正文）
+  for (const block of findEndTokenBlocks(text)) {
     if (covered(blocks, block.start)) continue;
     blocks.push(block);
   }
@@ -340,13 +382,21 @@ export function hasFabricatedToolResult(text) {
 
 /** 模型是否伪造了系统段落（RESULT / ## ROLE 段）——这些都不该由模型输出 */
 export function hasFabricatedProtocol(text) {
-  return findToolMarkup(text).some((block) => block.kind === 'RESULT' || block.kind === 'SECTION');
+  return findToolMarkup(text).some((block) => isFabricatedBlock(block));
 }
 
-/** 找出文本里第一个「模型伪造协议」的块（RESULT / 伪造 ## 段标题）；正常 DO / DSML / 原生工具调用不算 */
+/** 找出文本里第一个「模型伪造协议」的块（RESULT / 伪造 ## 段标题）；正常 DO / DSML / 原生工具调用 / END 不算 */
 export function findFabricatedBlock(text) {
   if (!text) return null;
-  return findToolMarkup(text).find((block) => block.kind === 'RESULT' || block.kind === 'SECTION') || null;
+  return findToolMarkup(text).find((block) => isFabricatedBlock(block)) || null;
+}
+
+/**
+ * 伪造协议的判定：RESULT / 伪造段标题。
+ * 自带的结束标记 `<|END|>` 只是格式标记（不触发重试、不提前终止），不在此列。
+ */
+function isFabricatedBlock(block) {
+  return (block.kind === 'RESULT' || block.kind === 'SECTION') && block.marker !== 'END';
 }
 
 /** 流式：提前找到伪造段标题的位置（完整行才算） */
@@ -495,6 +545,9 @@ export class ToolMarkupStreamFilter {
       // 半截 DO:/RESULT:、半截段落标题、半截原生工具 token：同样不能先发出去
       const pending = pendingProtocolStart(this.buffer, this.emitted);
       if (pending >= 0) limit = Math.min(limit, pending);
+      // 半截 <|END 也不能先发（完整 <|END|> 由 findToolMarkup 整块剔除）
+      const pendingEnd = findPendingEndToken(this.buffer, this.emitted);
+      if (pendingEnd >= 0) limit = Math.min(limit, pendingEnd);
     }
     return this.#slice(limit);
   }

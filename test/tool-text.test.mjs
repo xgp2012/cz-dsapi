@@ -12,6 +12,7 @@ import {
   suppressRepeatedToolCalls,
   ToolMarkupStreamFilter,
 } from '../src/openai/tool-text.mjs';
+import { parseToolCalls } from '../src/prompt/tools.mjs';
 
 /* ------------------------------------------------------------------ *
  * 流式收尾对齐：客户端已收到的内容 + 权威文本 → 还缺的尾巴
@@ -324,6 +325,49 @@ test('流式：伪造的段落标题不会漏进 content', () => {
   out += filter.flushRest();
   assert.ok(!out.includes('TOOL_RESULT_MESSAGES'), `流式漏了伪造段: ${out}`);
   assert.match(out, /就这样/);
+});
+
+// ---------------------------------------------------------------- <|END|> 结束标记
+
+test('stripToolMarkup: <|END|> 结束标记被剔除，不触发提前终止', () => {
+  for (const marker of ['<|END|>', '< | | END | | >', '<｜END｜>', '<| END |>']) {
+    const text = `回答完成。\n${marker}`;
+    const kinds = findToolMarkup(text).map((b) => b.kind);
+    assert.ok(kinds.includes('SECTION'), `${marker} 没被识别: ${kinds}`);
+    // END 只是格式标记，不算「编造协议」，不能触发 abort/重试
+    assert.equal(hasFabricatedProtocol(text), false, `${marker} 不应算编造协议`);
+    const cleaned = stripToolMarkup(text);
+    assert.equal(cleaned, '回答完成。', `${marker} 没清干净: ${JSON.stringify(cleaned)}`);
+  }
+});
+
+test('stripToolMarkup: <|END|> 只删标记，后面的正文保留（协议行另算）', () => {
+  // DO 行本来就是协议行（不进 content），这里只验证 END 不会把后面内容整段吞掉
+  const text = '先跑一下<|END|>\n接下来还有正文';
+  const cleaned = stripToolMarkup(text);
+  assert.ok(!cleaned.includes('|END|'), cleaned);
+  assert.equal(cleaned, '先跑一下\n接下来还有正文');
+
+  // END 与工具调用出现在同一段：content 里两者都不出现，但 END 不影响调用解析
+  const mixed = '先跑一下<|END|>\nDO:{"name":"exec_shell","args":{"command":"pwd"}}';
+  assert.equal(stripToolMarkup(mixed), '先跑一下');
+  assert.equal(parseToolCalls(mixed, ['exec_shell']).length, 1);
+
+  const inline = stripToolMarkup('中间<|END|>还有正文');
+  assert.equal(inline, '中间还有正文');
+});
+
+test('stripToolMarkup: 普通尖括号文本不受影响', () => {
+  const text = '当 a < b 且 b > c 时成立';
+  assert.equal(stripToolMarkup(text), text);
+});
+
+test('流式：半截 <|END 不会漏进 content，完整标记也不漏', () => {
+  const filter = new ToolMarkupStreamFilter();
+  let out = '';
+  for (const ch of '你好<|END|>世界') out += filter.push(ch);
+  out += filter.flushRest();
+  assert.equal(out, '你好世界');
 });
 
 // ---------------------------------------------------------------- 原生工具 token
