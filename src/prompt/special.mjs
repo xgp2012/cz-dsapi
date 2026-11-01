@@ -90,4 +90,4 @@ export const SECTION = {
 
 export const PROMPT_HEADER = '# MESSAGES:';
 export const FINAL_ANSWER_HINT =
-  'SYSTEM_ROLE_MESSAGES:上一轮工具调用你可能输出了xml标签调用工具，已被system在上下文中清理，工具已成功执行，请注意';
+  'SYSTEM_ROLE_MESSAGES:注意不要输出其他工具调用token
