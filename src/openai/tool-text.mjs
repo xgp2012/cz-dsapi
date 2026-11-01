@@ -53,14 +53,14 @@ const NATIVE_TOOL_TOKEN = /<[ \t]*\|[^|<>\r\n]{0,64}tool[^|<>\r\n]{0,64}\|[ \t]*
  */
 const END_TOKEN = /<[ \t]*[|｜][ \t]*(?:[|｜][ \t]*)?END[ \t]*(?:[|｜][ \t]*){1,2}[ \t]*>/gi;
 
-/** 找出 `<|END|>` 标记，作为 SECTION 类协议块（正文清洗时剔除） */
+/** 找出 `<|END|>` 标记，作为独立协议块（正文清洗时剔除，但不算伪造协议） */
 export function findEndTokenBlocks(text) {
   if (!text) return [];
   END_TOKEN.lastIndex = 0;
   const blocks = [];
   let match;
   while ((match = END_TOKEN.exec(text)) !== null) {
-    blocks.push({ kind: 'SECTION', marker: 'END', start: match.index, end: match.index + match[0].length });
+    blocks.push({ kind: 'END', start: match.index, end: match.index + match[0].length });
   }
   return blocks;
 }
@@ -211,7 +211,7 @@ function covered(blocks, index) {
   return blocks.some((block) => block.start <= index && index < block.end);
 }
 
-const KIND_RANK = { TOOL_CALL: 0, DO: 1, SECTION: 2, RESULT: 3 };
+const KIND_RANK = { TOOL_CALL: 0, DO: 1, END: 1, SECTION: 2, RESULT: 3 };
 
 function merge(blocks) {
   const sorted = blocks.sort((a, b) => a.start - b.start);
@@ -393,10 +393,10 @@ export function findFabricatedBlock(text) {
 
 /**
  * 伪造协议的判定：RESULT / 伪造段标题。
- * 自带的结束标记 `<|END|>` 只是格式标记（不触发重试、不提前终止），不在此列。
+ * 自带的结束标记 `<|END|>` 用独立的 END 类型，只是格式标记（不触发重试、不提前终止），不在此列。
  */
 function isFabricatedBlock(block) {
-  return (block.kind === 'RESULT' || block.kind === 'SECTION') && block.marker !== 'END';
+  return block.kind === 'RESULT' || block.kind === 'SECTION';
 }
 
 /** 流式：提前找到伪造段标题的位置（完整行才算） */

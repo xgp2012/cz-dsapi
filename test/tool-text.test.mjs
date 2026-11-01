@@ -333,7 +333,7 @@ test('stripToolMarkup: <|END|> 结束标记被剔除，不触发提前终止', (
   for (const marker of ['<|END|>', '< | | END | | >', '<｜END｜>', '<| END |>']) {
     const text = `回答完成。\n${marker}`;
     const kinds = findToolMarkup(text).map((b) => b.kind);
-    assert.ok(kinds.includes('SECTION'), `${marker} 没被识别: ${kinds}`);
+    assert.ok(kinds.includes('END'), `${marker} 没被识别: ${kinds}`);
     // END 只是格式标记，不算「编造协议」，不能触发 abort/重试
     assert.equal(hasFabricatedProtocol(text), false, `${marker} 不应算编造协议`);
     const cleaned = stripToolMarkup(text);
