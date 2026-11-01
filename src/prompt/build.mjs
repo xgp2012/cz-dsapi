@@ -1,6 +1,6 @@
 import { ApiError } from '../errors.mjs';
 import { contentToText } from '../util.mjs';
-import { FINAL_ANSWER_HINT, PROMPT_HEADER, SECTION, SPECIAL_TOKENS_HEADER } from './special.mjs';
+import { FINAL_ANSWER_HINT, PROMPT_HEADER, REPLY_END_TOKEN, SECTION, SPECIAL_TOKENS_HEADER } from './special.mjs';
 import { collectToolNames, renderToolDeclarations, renderToolResult } from './tools.mjs';
 
 const VALID_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool', 'function']);
@@ -109,7 +109,11 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
   }
 
   for (const section of sections) {
-    const body = section.lines.join('\n').trim();
+    let body = section.lines.join('\n').trim();
+    // END 结束标记只给模型看：输出给客户端时被过滤掉了，重建上下文时补回 assistant 段末尾
+    if (section.role === 'assistant' && !body.includes(REPLY_END_TOKEN)) {
+      body = body ? `${body}\n${REPLY_END_TOKEN}` : REPLY_END_TOKEN;
+    }
     parts.push('', SECTION[section.role], body);
   }
 
