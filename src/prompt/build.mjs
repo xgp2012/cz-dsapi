@@ -94,19 +94,19 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
     lastSection.lines.push('', FINAL_ANSWER_HINT);
   }
 
-  // 顺序：客户端 system 最上面 → 自带协议提示词放中间 → 工具声明 → 对话历史（user 在最后）
+  // 顺序：客户端 system → 工具声明 → 自带提示词（单独 system 块）→ 对话历史（user 在最后）
   const extra = typeof systemExtra === 'string' ? systemExtra.trim() : '';
   const parts = [PROMPT_HEADER, SECTION.system];
   const systemBody = [...systemTexts, extra].filter(Boolean).join('\n\n');
   if (systemBody) parts.push(systemBody);
 
-  // 自带的协议提示词放中间：夹在客户端 system 和工具声明/对话历史之间
-  parts.push('', SPECIAL_TOKENS_HEADER.trim());
-
   const toolLines = renderToolDeclarations(tools);
   if (toolLines.length) {
     parts.push('', SECTION.tools, ...toolLines);
   }
+
+  // 自带的协议提示词：单独一个 system 块，放在 TOOL_FUNCTIONS 之后、USER 之前
+  parts.push('', SECTION.system, SPECIAL_TOKENS_HEADER.trim());
 
   for (const section of sections) {
     let body = section.lines.join('\n').trim();
