@@ -90,4 +90,4 @@ export const SECTION = {
 
 export const PROMPT_HEADER = '# MESSAGES:';
 export const FINAL_ANSWER_HINT =
-  'SYSTEM_ROLE_MESSAGES:注意不要输出其他工具调用token
+  'SYSTEM_ROLE_MESSAGES:注意不要输出其他工具调用token'
