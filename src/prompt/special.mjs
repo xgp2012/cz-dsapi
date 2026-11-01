@@ -88,7 +88,5 @@ export const SECTION = {
 };
 
 export const PROMPT_HEADER = '# MESSAGES:';
-
-/** 最后一段是工具结果时，在段尾补一句「现在直接回答」，避免模型接着写 RESULT */
 export const FINAL_ANSWER_HINT =
-  'SYSTEM_ROLE_MESSAGES:It is absolutely forbidden to output any special token other than DO';
+  'SYSTEM_ROLE_MESSAGES:上一轮工具调用你可能输出了xml标签调用工具，已被system清理，请注意';
