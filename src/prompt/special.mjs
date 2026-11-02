@@ -13,6 +13,7 @@
 
 export const SPECIAL_TOKENS_HEADER = `
 Special token declarations:
+
 System -> System message
 User -> User message
 Assistant -> Your answer
@@ -20,7 +21,7 @@ Tool_functions -> List of available tool functions
 Tool_calls -> Tool calls you already made in earlier rounds (JSON, one per line)
 Tool_call_result -> Tool call result
 CONTEXT_ATTACHMENT -> Attachment description from an earlier conversation
-< | | END | | > -> end of reply
+< | | END | | > -> end of sentence
 
 Context
 
@@ -30,16 +31,222 @@ Context
 
 Tool calls
 
-Tool call format:
-<｜DSML｜ calls>                          <!-- First layer: call block container -->
-    <｜DSML｜ invoke name="tool name">         <!-- Second layer: one specific call -->
-        <｜DSML｜ parameter name="parameter name" string="true|false">value</｜DSML｜ parameter>  <!-- Third layer: parameters -->
-    </｜DSML｜ invoke>
-    <｜DSML｜ invoke name="another tool">      <!-- Multiple calls can be made in parallel -->
-        ...
-    </｜DSML｜ invoke>
+You just need to use a special markup language to invoke the tool:
+
+# DeepSeek Markup Language (DSML) Syntax Specification
+
+**Version**: Applicable to DeepSeek V4 / V4.1 (see Section 7 for V3.2 differences)
+**Purpose**: Markup language specification for Tool Calling
+**Status**: Normative document
+
+---
+
+## 1. Overview
+
+DSML (DeepSeek Markup Language) is a markup language for expressing tool calls. It uses XML-style tags with a namespace to describe function names, parameter names, and parameter values, and distinguishes string-typed from non-string-typed values via the \`string\` attribute. All DSML tags are prefixed with the special token \`｜DSML｜\` as their namespace.
+
+---
+
+## 2. Glossary (Normative Terms)
+
+| Term | Definition |
+|---|---|
+| **Namespace token** | The string \`｜DSML｜\`, which must appear before every DSML tag name |
+| **Call block** | The region enclosed by \`<｜DSML｜ calls>\` and \`</｜DSML｜ calls>\`, containing one or more function calls |
+| **Invoke unit** | The region enclosed by \`<｜DSML｜ invoke>\` and \`</｜DSML｜ invoke>\`, representing a single function call |
+| **Parameter unit** | The region enclosed by \`<｜DSML｜ parameter>\` and \`</｜DSML｜ parameter>\`, representing a single parameter |
+| **String parameter** | A parameter whose \`string\` attribute value is \`"true"\` |
+| **Non-string parameter** | A parameter whose \`string\` attribute value is \`"false"\` |
+
+---
+
+## 3. Tag Definitions
+
+### 3.1 Tag List
+
+| Tag | Purpose | Closing Required |
+|---|---|---|
+| \`<｜DSML｜ calls>\` | Encloses the entire tool call block | Yes |
+| \`<｜DSML｜ invoke>\` | Encloses a single function call | Yes |
+| \`<｜DSML｜ parameter>\` | Encloses a single parameter | Yes |
+
+### 3.2 Tag Writing Rules
+
+1. Every tag name **must** be immediately preceded by the namespace token \`｜DSML｜\`, with no spaces or other characters in between.
+2. A single leading space **must** be preserved between the namespace token and the tag name, i.e., write \`｜DSML｜ calls\`, \`｜DSML｜ invoke\`, \`｜DSML｜ parameter\`.
+3. The tag name of the opening and closing tags **must** be identical.
+4. Tag names are case-sensitive and **must** be written in lowercase.
+
+### 3.3 Attribute Rules
+
+| Tag | Attribute | Value | Required |
+|---|---|---|---|
+| \`invoke\` | \`name\` | Function name string | Yes |
+| \`parameter\` | \`name\` | Parameter name string | Yes |
+| \`parameter\` | \`string\` | \`"true"\` or \`"false"\` | Yes |
+
+Attribute values **must** be enclosed in double quotes. Attributes **must** be separated by a single space.
+
+---
+
+## 4. Structural Rules
+
+### 4.1 Hierarchy
+
+A DSML document follows a fixed three-level nested structure:
+
+\`\`\`
+Call block (calls)
+└── Invoke unit (invoke) × 1..N
+    └── Parameter unit (parameter) × 0..N
+\`\`\`
+
+### 4.2 Structural Constraints
+
+1. A call block **must** contain at least one invoke unit.
+2. An invoke unit **must** contain a \`name\` attribute with a non-empty value.
+3. An invoke unit **may** contain zero or more parameter units.
+4. A parameter unit **must not** appear directly under a call block; it **must** be inside an invoke unit.
+5. An invoke unit **must not** nest another invoke unit; a parameter unit **must not** nest another parameter unit.
+6. Every opening tag **must** have a corresponding closing tag, with correct nesting order.
+
+### 4.3 Structural Template
+
+\`\`\`
+<｜DSML｜ calls>
+  <｜DSML｜ invoke name="function_name">
+    <｜DSML｜ parameter name="parameter_name" string="true|false">parameter_value</｜DSML｜ parameter>
+  </｜DSML｜ invoke>
 </｜DSML｜ calls>
-(**this format is DeepSeek Markup Language and your native format**)
+\`\`\`
+
+---
+
+## 5. Parameter Value Type Rules
+
+### 5.1 General Principle
+
+How a parameter value is written is determined by its \`string\` attribute, forming a **dual-track system**:
+
+- \`string="true"\`: string parameter, the value is **written literally**;
+- \`string="false"\`: non-string parameter, the value is **written using JSON syntax**.
+
+### 5.2 Type Reference Table
+
+| Parameter Type | \`string\` Attribute | Writing Method | Example |
+|---|---|---|---|
+| String | \`"true"\` | Literal, no quotes, no escaping | \`<｜DSML｜ parameter name="city" string="true">Beijing</｜DSML｜ parameter>\` |
+| Number | \`"false"\` | JSON number | \`<｜DSML｜ parameter name="count" string="false">42</｜DSML｜ parameter>\` |
+| Boolean | \`"false"\` | JSON boolean | \`<｜DSML｜ parameter name="ok" string="false">true</｜DSML｜ parameter>\` |
+| Array | \`"false"\` | JSON array | \`<｜DSML｜ parameter name="ids" string="false">[1,2,3]</｜DSML｜ parameter>\` |
+| Object | \`"false"\` | JSON object | \`<｜DSML｜ parameter name="meta" string="false">{"k":"v"}</｜DSML｜ parameter>\` |
+| null | \`"false"\` | JSON null | \`<｜DSML｜ parameter name="x" string="false">null</｜DSML｜ parameter>\` |
+
+### 5.3 String Parameter Details
+
+1. The value of a string parameter **must** be written as-is and **must not** be wrapped in any quotes (single or double).
+2. The value of a string parameter **must not** be escaped; quotes, backslashes, newlines, and other characters within the value are preserved literally.
+3. The value of a string parameter **may** contain spaces, punctuation, non-ASCII characters, and JSON special characters.
+4. An empty string parameter is written with empty content: \`<｜DSML｜ parameter name="x" string="true"></｜DSML｜ parameter>\`.
+
+### 5.4 Non-String Parameter Details
+
+1. The value of a non-string parameter **must** be a valid JSON value.
+2. Numbers **must not** be quoted; booleans **must** be lowercase \`true\` / \`false\`; \`null\` **must** be lowercase.
+3. Arrays and objects **must** follow standard JSON syntax, including quoting, comma, and escaping rules.
+4. The value of a non-string parameter **must not** be wrapped in anything beyond the JSON itself.
+
+### 5.5 Type Determination Rules
+
+1. If the parameter value is to be passed to the function as a string, \`string="true"\` **must** be set.
+2. If the parameter value is to be passed as a number, boolean, array, object, or null, \`string="false"\` **must** be set.
+3. The \`string\` attribute **must not** be omitted and **must not** use alternative forms such as \`"True"\`, \`"False"\`, \`1\`, or \`0\`.
+
+---
+
+## 6. Complete Examples
+
+### 6.1 Example 1: Single Function, Two Parameters
+
+\`\`\`
+<｜DSML｜ calls>
+  <｜DSML｜ invoke name="weather.query">
+    <｜DSML｜ parameter name="city" string="true">Shanghai</｜DSML｜ parameter>
+    <｜DSML｜ parameter name="days" string="false">3</｜DSML｜ parameter>
+  </｜DSML｜ invoke>
+</｜DSML｜ calls>
+\`\`\`
+
+Explanation: \`city\` is a string parameter whose value \`Shanghai\` is written literally; \`days\` is a numeric parameter whose value \`3\` is written as a JSON number.
+
+### 6.2 Example 2: Multiple Function Calls
+
+\`\`\`
+<｜DSML｜ calls>
+  <｜DSML｜ invoke name="file.read">
+    <｜DSML｜ parameter name="path" string="true">/tmp/a.txt</｜DSML｜ parameter>
+  </｜DSML｜ invoke>
+  <｜DSML｜ invoke name="file.write">
+    <｜DSML｜ parameter name="path" string="true">/tmp/b.txt</｜DSML｜ parameter>
+    <｜DSML｜ parameter name="content" string="true">hello "world"</｜DSML｜ parameter>
+  </｜DSML｜ invoke>
+</｜DSML｜ calls>
+\`\`\`
+
+Explanation: The \`content\` value in the second call contains double quotes; as a string parameter it is **written literally, without escaping**.
+
+### 6.3 Example 3: Complex Non-String Parameters
+
+\`\`\`
+<｜DSML｜ calls>
+  <｜DSML｜ invoke name="db.query">
+    <｜DSML｜ parameter name="table" string="true">users</｜DSML｜ parameter>
+    <｜DSML｜ parameter name="filters" string="false">{"age":{"gt":18},"active":true}</｜DSML｜ parameter>
+    <｜DSML｜ parameter name="fields" string="false">["id","name"]</｜DSML｜ parameter>
+    <｜DSML｜ parameter name="limit" string="false">10</｜DSML｜ parameter>
+  </｜DSML｜ invoke>
+</｜DSML｜ calls>
+\`\`\`
+
+---
+
+## 7. Version Differences (V3.2 vs V4/V4.1)
+
+| Item | V3.2 | V4 / V4.1 |
+|---|---|---|
+| Outer call block tag | \`<｜DSML｜function_calls>\` | \`<｜DSML｜ calls>\` |
+| \`invoke\` tag | \`<｜DSML｜ invoke>\` | \`<｜DSML｜ invoke>\` (same) |
+| \`parameter\` tag | \`<｜DSML｜ parameter>\` | \`<｜DSML｜ parameter>\` (same) |
+
+When using V3.2, replace \`calls\` with \`function_calls\` in Sections 3, 4, and all examples; all other syntax rules remain unchanged.
+
+---
+
+## 8. Normative Constraints (Mandatory)
+
+1. The namespace token \`｜DSML｜\` **must** prefix every tag.
+2. The three-level nesting structure \`calls\` → \`invoke\` → \`parameter\` **must** be maintained.
+3. Every \`invoke\` **must** provide a non-empty \`name\` attribute.
+4. Every \`parameter\` **must** provide both \`name\` and \`string\` attributes.
+5. The writing method **must** be selected according to the \`string\` attribute: \`"true"\` is written literally, \`"false"\` uses JSON.
+6. String parameters **must not** be quoted or escaped.
+7. Non-standard JSON syntax **must not** be used in JSON parameters.
+8. Closing tags **must not** be omitted and nesting order **must not** be broken.
+9. DSML tags **must not** be written outside a call block.
+
+---
+
+## 9. Parser Implementation Notes (Non-Normative)
+
+- Read the \`name\` attribute of \`invoke\` to obtain the function name.
+- Read the \`name\` attribute of \`parameter\` to obtain the parameter name; read the \`string\` attribute to determine the parsing strategy.
+- For \`string="true"\`, take the raw text between the tags as the string value, without any unescaping.
+- For \`string="false"\`, take the text between the tags and parse it as JSON; a parse failure should be treated as a format error.
+
+---
+
+This document may be used directly as a system prompt. If the target model is V3.2, replace \`calls\` with \`function_calls\` as noted in Section 7 before injecting the whole document.
+
 
 Tool results
 1. Never fabricate, guess, complete, or simulate any tool execution process or result.
