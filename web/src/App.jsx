@@ -70,6 +70,14 @@ export default function App({ initialTheme = 'auto' }) {
     toast('API Key 已保存');
   };
 
+  const clearKey = () => {
+    setApiKey('');
+    setKeyDraft('');
+    setKeyDialogOpen(false);
+    setRefreshKey((value) => value + 1);
+    toast('已清除本机保存的 API Key');
+  };
+
   return (
     <div className="layout">
       <mdui-top-app-bar>
@@ -131,7 +139,8 @@ export default function App({ initialTheme = 'auto' }) {
           <div className="dialog-card" onClick={(event) => event.stopPropagation()}>
             <h2>需要 API Key</h2>
             <p className="muted">
-              服务端配置了 <code>API_KEY</code>，后台接口需要带上同一个 key 才能访问。输入一次后会保存在本机浏览器里。
+              服务端配置了 <code>API_KEY</code>，后台接口需要带上同一个 key 才能访问。
+              输入一次后会保存在本机浏览器的 localStorage 里（key 在项目根目录的 .env，或控制台「设置」页里改）。
             </p>
             <TextField
               label="API Key"
@@ -142,6 +151,11 @@ export default function App({ initialTheme = 'auto' }) {
               autosize
             />
             <div className="row" style={{ justifyContent: 'flex-end' }}>
+              {getApiKey() ? (
+                <Btn variant="text" onClick={clearKey}>
+                  清除已保存的 Key
+                </Btn>
+              ) : null}
               <Btn variant="text" onClick={() => setKeyDialogOpen(false)}>
                 取消
               </Btn>

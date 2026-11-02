@@ -14,6 +14,8 @@ export function makeConfig(overrides = {}) {
     ...process.env,
     DATA_DIR: dataDir,
     DEEPSEEK_USER_TOKEN: 'test-token-0123456789abcdef',
+    // 不继承本地 .env 里真实的 API_KEY，否则测试里的服务会要求鉴权
+    API_KEY: '',
     ...overrides,
   });
 }

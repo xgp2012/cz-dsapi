@@ -74,7 +74,8 @@ export function createServer({ config, logger, web }) {
 
       // ---- 网页控制台（/admin 静态页，/admin/api/* 管理接口）----
       if (url.pathname === '/admin' || url.pathname.startsWith('/admin/')) {
-        return admin(req, res, url);
+        // 必须 await：鉴权失败 / 接口异常要以 401 / 4xx 返回，不能被当成未捕获错误变成 500
+        return await admin(req, res, url);
       }
 
       if (req.method === 'GET' && url.pathname === '/v1/models') {

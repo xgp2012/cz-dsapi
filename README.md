@@ -6,7 +6,7 @@
 
 **与其他项目不同，因为没有明显的工具调用特征，实测按照提示使用此项目个人使用无封号/禁言问题**
 
-上下文不打在服务端：每条请求都把历史按 `SYSTEM_ROLE_MESSAGES` / `USER_ROLE_MESSAGES` / `ASSISTANT_ROLE_MESSAGES` 的段落格式拼成一条 prompt，作为一次**全新对话**发给模型。客户端 system 在最上面，自带的协议提示词夹在中间，工具声明和 user/对话历史在后面。
+上下文不打在服务端：每条请求都把历史按 `## System` / `## User` / `## Assistant` / `## Tool_calls` / `## Tool_call_result` 的段落格式拼成一条 prompt，作为一次**全新对话**发给模型。客户端 system 在最上面，自带的协议提示词夹在中间，工具声明和 user/对话历史在后面。
 
 两种引擎，默认 **direct**（Playwright 驱动真实网页）：
 
@@ -28,13 +28,14 @@
 - **OpenAI 兼容**：`POST /v1/chat/completions` 非流式 + SSE 流式；增量与最终文本逐字符一致
 - **Anthropic 兼容**：`POST /v1/messages`（流式 / 非流式 / tools / thinking 块）+ `count_tokens`，Claude SDK 直接指过来就能用
 - 上下文无状态，每个请求都是一次全新对话
-- `tools` → `tool_calls` / `tool_use`：模型按 **`DO:{"name":...,"args":...}`** 单行格式输出（见下文）；**browser 引擎会抓页面原始补全流兜底，保证工具调用 token 不丢**。模型偶尔退回原生 DSML / `<tool_call>` 时会被静默救回，既不漏给客户端，也不写进历史
+- `tools` → `tool_calls` / `tool_use`：模型按**原生 DSML** 语法输出工具调用（见下文），服务端解析成标准 `tool_calls`；**browser 引擎会抓页面原始补全流兜底，保证工具调用 token 不丢**。历史里回写的是 `## Tool_calls` 段的 JSON 行，绝不写 DSML
 - **防止模型自造工具结果**：`RESULT` 单独成段 + 多写法识别 + 出口清洗 + 非流式重试（见下文）
 - **超长上下文自动转附件**：超过 10 万字时把较早的对话塞进 `.txt` 附件，用 `ref_file_ids` 注入（见下文）
 - **图片输入**：`image_url`（data URL 或 http 链接）→ 自动传成网页附件 → `ref_file_ids`
 - 「深度思考」默认打开，思考内容走 `reasoning_content`，且**一定排在正文之前**
 - 登录态用 `userToken` 注入；直连模式不需要浏览器
 - 账号级限流保护：发送间隔 + 冷却重试
+- **网页控制台**：`/admin`（React + Vite + [mdui 2](https://www.mdui.org)）管状态 / 号池 / 测试 / 日志 / 配置，不用再敲命令
 - 无 root 环境（Android 容器）有现成的 Chromium 依赖解包脚本
 
 ---
@@ -74,6 +75,7 @@ token 存在 `data/auth.json`（0600，已 gitignore）。
 ```bash
 npm run up        # 后台启动（detach，日志 data/server.log，pid data/server.pid）
 npm run status    # 看状态 / 引擎 / PoW 是否就绪
+npm run restart   # 重启（改完配置 / 换完 token 用）
 npm run down      # 停止
 ```
 
@@ -82,6 +84,17 @@ npm run down      # 停止
 > **如果用 pm2 托管**（`pm2 list` 里能看到 `index`），重启请用 `pm2 restart index`：
 > `npm run down` 杀掉进程后会被 pm2 立刻拉起，`npm run up` 则会发现端口已被占用。
 > 改完代码后确认进程启动时间晚于文件 mtime，或直接 `pm2 restart index`。
+
+> **网页控制台（推荐）**：先构建一次前端，然后打开 <http://127.0.0.1:8787/admin>：
+>
+> ```bash
+> npm run admin:install   # 安装 web/ 的前端依赖（React + Vite + mdui）
+> npm run admin:build     # 构建到 web/dist，服务会自动托管
+> ```
+>
+> 状态、号池 token、登录态校验、测试请求、日志、配置、重启都能在页面里点。
+> 如果配置了 `API_KEY`，打开 `/admin` 会弹框要求输入同一个 key（存在浏览器 localStorage，右上角钥匙图标可修改 / 清除）。
+> 开发前端时用 `npm run admin:dev`（Vite 会热更新并把 /admin/api、/v1 代理到 8787）。
 
 ### 3. 调用
 
@@ -180,11 +193,11 @@ curl -s http://127.0.0.1:8787/v1/messages/count_tokens \
 
 | Anthropic | 本服务内部 | 说明 |
 | --- | --- | --- |
-| `system`（顶层，字符串 / text 块数组） | `## SYSTEM_ROLE_MESSAGES` | 多条 text 块按换行合并 |
+| `system`（顶层，字符串 / text 块数组） | `## System` | 多条 text 块按换行合并 |
 | `content` 里的 `text` 块 | 正文 | |
 | `content` 里的 `image` 块（base64 / url） | `image_url` → 网页附件 | 单张 ≤10MB，最多 8 张 |
-| `assistant` 的 `tool_use` 块 | DO 调用行 | `input` 对象原样写进 `args` |
-| `user` 里的 `tool_result` 块 | `## TOOL_RESULT_MESSAGES` | 独立成段，不会并进 assistant |
+| `assistant` 的 `tool_use` 块 | `## Tool_calls` 的 JSON 行 | `input` 对象原样写进 `args` |
+| `user` 里的 `tool_result` 块 | `## Tool_call_result` | 独立成段，不会并进 assistant |
 | `tools[].input_schema` | `function.parameters` | |
 | `thinking: {type:"enabled"}` | 网页「深度思考」 | |
 | 响应 `stop_reason` | `tool_use` / `end_turn` | |
@@ -269,61 +282,74 @@ npm run auth -- --list      # 查看号池（token 打码）
 **客户端 system 在最上面、自带协议提示词夹在中间、工具声明和对话历史（user）在后面**：
 
 ```
-MESSAGES:
-SYSTEM_ROLE_MESSAGES:
+# Messages:
+## System:
   …客户端传入的 system / 额外约束（最上面）…
-  …自带的特殊 token 声明 / DO 规范（中间）…
-TOOL_FUNCTIONS:
+## Tool_functions:
   …工具声明（每行一个 JSON）…
-USER_ROLE_MESSAGES:
+## System:
+  …自带的特殊 token 声明 / 原生 DSML 工具调用规范（中间）…
+## User:
   …对话历史，直到最后一问（user 在最后）…
-ASSISTANT_ROLE_MESSAGES:
-  …模型历史回答…
-TOOL_CALL_RESULT:
-  …工具结果…
+## Assistant:
+  …模型历史回答… < | | END | | >
+## Tool_calls:
+  {"name":"exec_shell","args":{"command":"uname -a"}}
+## Tool_call_result:
+  {"name":"exec_shell","result":"Linux …"}
 ```
 
 - 客户端传入的 **system 放在最上面**，模型先看到调用方的设定；
 - 自带的协议提示词（`SPECIAL_TOKENS_HEADER`）夹在客户端 system 和工具声明/对话历史之间；
 - **user 消息和对话历史排在最后**，要回答的问题离生成位置最近。
 
-**工具结果单独成段**（`<|TOOL_CALL_RESULT|>`），不会并进 `ASSISTANT_ROLE_MESSAGES`。
+历史里的工具调用**只渲染成 `## Tool_calls` 段里的 JSON 行，绝不写 DSML**：
+模型输出走原生 DSML，但拼接上下文时不能把 DSML 写回去，否则模型会照抄语法、把调用当正文吐出来。
+
+**工具结果单独成段**（`## Tool_call_result`），不会并进 `## Assistant`。
 这是关键：模型是照着自己段落里的写法往后接的，只要 `RESULT` 从不以「assistant 说过的话」的形式出现，
-它就没有可模仿的样板。最后一段是工具结果时，段尾还会补一句「直接回答」把话头收回来。
+它就没有可模仿的样板。
 
 ## 工具调用
 
-模型按单行 DO 格式输出工具调用，解析后转成标准 `tool_calls` / `tool_use`，
+模型按**原生 DSML** 语法输出工具调用，服务端解析后转成标准 `tool_calls` / `tool_use`，
 并从 `content` / SSE 增量里剔除：
 
 ```
-DO:{"name":"exec_shell","args":{"command":"uname -a","timeout":30}}
+<｜DSML｜ calls>
+    <｜DSML｜ invoke name="exec_shell">
+        <｜DSML｜ parameter name="command" string="true">uname -a</｜DSML｜ parameter>
+    </｜DSML｜ invoke>
+</｜DSML｜ calls>
 ```
 
-- `DO` 行首（大小写不敏感）+ 半角 / 全角冒号都认；JSON 可以跨行（pretty print）、可以包在代码块里、行尾带正文也能解析；
-- 参数放在 `args`（也兼容 `arguments`）；字符串 / 数字 / 布尔 / 数组 / 对象按 JSON 原样写；
-- `content` 里不会残留协议行；模型把刚执行过的调用又复述一遍时，会被判重丢弃（不同格式的等价参数也算重复）。
+- 全角 `｜` / 半角 `|`、单层 / 双层竖线、外层 `calls` / `tool_calls` 都能认；标签内外允许空格，
+  attribute 值允许单/双引号或不带引号；
+- `string="false"` 的参数按 JSON 解码（数字 / 布尔 / 数组 / 对象），缺省当字符串；
+- 调用被截断（流式半截 / 缺闭合标签）时，尽量把已完整的参数解析出来；
+- `content` 里不会残留协议块；模型把刚执行过的调用又复述一遍时，会被判重丢弃。
 
-**DSML 已废弃**：提示词和历史里都不再教 / 不再出现 DSML，只需要 DO。模型万一还是原生吐出
-DSML / `<tool_call>`，服务端会把它救回来（见下一节），但绝不会写进历史。
+**拼接上下文时绝不写 DSML**：历史里的调用只渲染成 `## Tool_calls` 段的 JSON 行（见上一节），
+模型只从 system 提示词里学输出语法，不会从历史里照抄。旧版 `DO:` 行 / `<tool_call>` /
+原生 `<|tool▁calls▁begin|>` token 仅作静默兜底解析（不记日志、不写历史）。
 
-**结束标记 `<|END|>` 只给模型看**：提示词要求模型每轮完成后写 `<|END|>`，它是特殊 token，不能出现在发给客户端的
-`content` / SSE 里（streaming 和非流式都会剔除，流式里半截的 `<|END` 也会先扣住不发；它只是格式标记，**不会**触发
-「编造协议」的提前终止或重试）。但拼上下文时会把它补回每个 `ASSISTANT_ROLE_MESSAGES` 段的末尾，
-模型在历史里能看到上一轮回答在哪结束。
+**结束标记 `<|END|>` 只给模型看**：提示词要求模型每轮完成后写 `<|END|>`（实际写法 `< | | END | | >`），
+它是特殊 token，不能出现在发给客户端的 `content` / SSE 里（streaming 和非流式都会剔除，流式里半截的
+`<|END` 也会先扣住不发；它只是格式标记，**不会**触发「编造协议」的提前终止或重试）。
+但拼上下文时会把它补回每个 `## Assistant` 段的末尾，模型在历史里能看到上一轮回答在哪结束。
 
 ### 工具调用 token 保护（browser 模式）
 
-网页版模型偶尔会「不听话」：DO 块出现在最后一行、DOM 渲染延迟、轮询提前判定结束，
+网页版模型偶尔会「不听话」：工具调用块出现在最后一行、DOM 渲染延迟、轮询提前判定结束，
 都可能让工具调用 token 在半路丢掉。browser 引擎为此做了三层保护：
 
 1. **原始流优先**：页面自己发出的 `POST /api/v0/chat/completion` SSE 由 Playwright 截获
    （`page.on('response')`），用 patch 解析器还原成模型原始输出；`tool_calls` 从原始文本解析，
    DOM 只负责流式展示 —— DOM 提前结束 / 文本回退 / 渲染丢字符都不影响最终结果。
 2. **DOM 永不缩水**：轮询期间记录「按前缀增长的最长文本」，结束快照变短会重试并取最长，
-   避免末尾的 DO 块被覆盖。
-3. **原生格式静默救回**：真收到 DSML / `<tool_call>` 时仍解析成 `tool_calls`（日志记 warn），
-   但绝不回写历史、也不出现在 `content` 里。
+   避免末尾的工具调用块被覆盖。
+3. **静默兜底解析**：DSML 是正式协议；`<tool_call>` / 原生 token / 旧版 DO 只作兜底解析，不记日志，
+   也绝不回写历史、不会出现在 `content` 里。
 
 `BROWSER_CAPTURE=false` 可关掉第 1 层（退回纯 DOM 提取，不推荐）。
 
@@ -332,7 +358,7 @@ DSML / `<tool_call>`，服务端会把它救回来（见下一节），但绝不
 网页版模型有个坏习惯：看到 `RESULT` 就自己往后编一段「执行结果」，再把答案建立在这段假结果上。
 这里做了四层处理：
 
-1. **协议上隔离**：`RESULT` 只出现在 `< || TOOL_RESULT_MESSAGES | | >:` 段，system 段明确写「你绝对不能输出 RESULT」；
+1. **协议上隔离**：`RESULT` 只出现在 `## Tool_call_result` 段，system 段明确写「绝对不能输出 RESULT」；
 2. **识别放宽**：不只认行首 `RESULT:`，`**RESULT:**`、`RESULT：`（全角冒号）、`result:`（小写）、
    `- RESULT:`、`` ``` `` 代码块里的、以及行内 `结果：RESULT:{...}` 都会被识别；
 3. **出口清洗**：命中的内容从 `content` 和 SSE 增量里剔除，顺带清掉只剩空壳的代码块；
@@ -346,24 +372,27 @@ DSML / `<tool_call>`，服务端会把它救回来（见下一节），但绝不
 `ref_file_ids` 可以挂附件，附件不占输入框长度，所以拼接后的 prompt 超限时会自动拆一次：
 
 ```
-正文（≤ MAX_PROMPT_CHARS）：     附件（.txt）：
-# MESSAGES:                      # 对话历史（较早部分）
-## SYSTEM_ROLE_MESSAGES          ## USER_ROLE_MESSAGES:
-  …客户端 system…                  （较早的对话）
-  …特殊 token 声明（中间）…         ## ASSISTANT_ROLE_MESSAGES:
-## TOOL_FUNCTIONS:                 …
-  …工具声明…
+正文（≤ MAX_PROMPT_CHARS）：        附件（.txt）：
+# Messages:                         # 对话历史（较早部分）
+## System:                          ## System:
+  …客户端 system（太大时拆走）…        （早期 system 提示）
+## Tool_functions:                  ## Tool_functions:
+  …工具声明（太大时拆走）…             （早期工具声明）
+## System:
+  …特殊 token 声明（永远留在正文）…
 ## CONTEXT_ATTACHMENT:
-  较早的 12 段对话已作为附件
+  较早的 12 个段落已作为附件
   context-53772c8f.txt 上传…
-## USER_ROLE_MESSAGES:
+## User:
   （最近的段落，直到最后一问）
 ```
 
 规则：
 
-- 只切在 `## USER_ROLE_MESSAGES` / `## ASSISTANT_ROLE_MESSAGES` / `## TOOL_RESULT_MESSAGES` 段落边界，不切碎单条消息；
-- **保留最新的段落**（要回答的问题在最后），较早的进附件；客户端 system 段、自带协议提示词和工具声明永远留在正文；
+- 只切在 `## System` / `## Tool_functions` / `## User` / `## Assistant` / `## Tool_calls` / `## Tool_call_result` 段落边界，不切碎单条消息；
+- **保留最新的段落**（要回答的问题在最后），较早的进附件；
+- **自带协议提示词永远留在正文**（模型要先看到 DSML 调用格式）；
+- 客户端 system 提示或工具声明过于庞大、正文挤不下足够新的对话时，它们也会被移进附件（先移最靠前的）；
 - 最后一段自己就超长（比如读了一个大文件）时，保留它的尾部，前面部分进附件；
 - 附件按内容 hash 缓存 30 分钟，同样内容不会重复上传；上传一次约多 0.3~1s；
 - 正文里会带一段 `## CONTEXT_ATTACHMENT:` 说明，要求模型先读附件再回答。
@@ -371,6 +400,7 @@ DSML / `<tool_call>`，服务端会把它救回来（见下一节），但绝不
 实测 12 万字上下文：正文 98,756 字 + 附件 25,572 字，整轮 3.8s，模型能正确引用附件里的内容。
 
 `OVERFLOW_TO_ATTACHMENT=false` 可恢复旧行为（超限直接 413）。浏览器引擎不支持附件，只能直连。
+
 
 ---
 
@@ -385,6 +415,26 @@ DSML / `<tool_call>`，服务端会把它救回来（见下一节），但绝不
 | `GET /v1/models` | 通用 | 模型列表 |
 | `GET /healthz` | 通用 | 健康检查，返回引擎 / PoW / 会话状态 |
 | `GET /` | 通用 | 说明页 |
+| `GET /admin` | 控制台 | 网页后台（React + Vite + mdui 2，静态资源由同一进程托管） |
+
+### 后台管理接口
+
+控制台页面在 `/admin`（首次使用先 `npm run admin:install && npm run admin:build`）。
+接口都在 `/admin/api/*`，配置了 `API_KEY` 时要求带同一个 key（`Authorization: Bearer <key>` 或 `x-api-key: <key>`）：
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /admin/api/overview` | 服务状态 / 账号池 / 运行环境 |
+| `GET /admin/api/accounts` | 号池（运行中 + 已保存） |
+| `POST /admin/api/accounts` | 保存 token（`{tokens, mode: append\|replace}`） |
+| `POST /admin/api/accounts/verify` | 逐条校验登录态（会真的发一条最短消息） |
+| `POST /admin/api/accounts/remove` | 删除已保存 token（`{index}`，1 起） |
+| `GET /admin/api/config` · `PUT /admin/api/config` | 读 / 写项目根目录 `.env`（重启后生效） |
+| `GET /admin/api/logs?lines=300` | 读 `data/server.log` 尾部 |
+| `POST /admin/api/restart` | 调 `server-ctl restart` 重启服务 |
+
+> 静态页面本身公开，`/admin/api/*` 才鉴权。浏览器端在首次 401 时弹出输入框，
+> key 保存在 localStorage（`fuckds-admin-api-key`），右上角钥匙图标可修改 / 清除。
 
 思考开关：默认开（`DEEPSEEK_THINKING=always`），请求体传 `"thinking": false` 可单次关闭；`auto` 按模型名，`never` 全关。
 
@@ -410,7 +460,7 @@ DSML / `<tool_call>`，服务端会把它救回来（见下一节），但绝不
 | `DEEPSEEK_THINKING` | `always` | `always` / `auto` / `never` |
 | `DEEPSEEK_SEARCH` | `false` | 是否开「智能搜索」 |
 | `HOST` / `PORT` | `127.0.0.1` / `8787` | 监听地址 |
-| `API_KEY` | 空 | 设置后要求 `Authorization: Bearer <key>` |
+| `API_KEY` | 空 | 设置后要求 `Authorization: Bearer <key>`（后台接口也要求同一个 key） |
 | `CONCURRENCY` | `1` | 并发请求数 |
 | `SEND_INTERVAL_MS` | `4000` | 两次发送的最小间隔 |
 | `RATE_LIMIT_BACKOFF_MS` | `4000` | 命中限流后的冷却（按次数递增） |
@@ -427,6 +477,7 @@ DSML / `<tool_call>`，服务端会把它救回来（见下一节），但绝不
 | `OVERFLOW_TO_ATTACHMENT` | `true` | 超长时转附件；`false` 则超限直接 413 |
 | `IDLE_SHUTDOWN_MS` | `900000` | 浏览器引擎空闲回收 |
 
+上面这些（以及日志级别、并发、超时等）大多可以在网页控制台的「设置」页直接改，写回 `.env` 后重启生效。
 完整列表见 [.env.example](.env.example)。
 
 ---
@@ -444,10 +495,16 @@ src/
 │   ├── pow.mjs           # Go 求解器封装
 │   └── stream.mjs        # SSE patch 解析
 ├── browser/              # Playwright 引擎：DOM 流式 + 原始补全流截获
-├── prompt/               # prompt 拼接 / 超长转附件 / DO 工具协议（原生格式兜底解析）
+├── prompt/               # prompt 拼接 / 超长转附件 / DSML 工具协议解析
+│   ├── special.mjs       # 特殊 token 声明（system 提示词）
+│   ├── build.mjs         # 历史 → ## 段落 prompt
+│   ├── dsml.mjs          # 原生 DSML 调用解析
+│   └── overflow.mjs      # 超长转附件
+├── admin/                # 网页控制台接口（/admin/api/* + web/dist 静态托管）
 ├── anthropic/            # Anthropic Messages API（请求归一化 / 块与事件 / SSE）
 └── openai/               # OpenAI 协议 / SSE / 工具文本过滤
 cmd/powd/main.go          # Go PoW 求解器
+web/                      # 后台前端（React + Vite + mdui 2，构建产物 web/dist）
 deepseek_hash.go          # DeepSeekHashV1
 deepseek_pow.go           # SolvePow / header 组装
 ```
@@ -480,6 +537,14 @@ browser 引擎单轮 2.2–2.9s（浏览器导航 + DOM 轮询）；直连引擎
 
 **页面/接口改版**
 直连：改 `src/direct/client.mjs` 的路径和字段；兜底：改 `src/browser/page-scripts.mjs` 顶部的选择器。
+
+**网页控制台打不开 / 只有一行提示**
+前端要先构建：`npm run admin:install && npm run admin:build`，产物在 `web/dist`。
+如果看到「控制台还没构建」，按页面上的命令跑一遍即可；开发时也可以用 `npm run admin:dev`。
+
+**配了 API_KEY，怎么访问控制台**
+打开 `/admin` 后页面会弹框要求输入 key（和 API 用的是同一个 `API_KEY`），输一次存在浏览器 localStorage；
+以后换 key 或清除，点右上角的钥匙图标。也可以通过环境变量 / `.env` 修改 key，重启服务后生效。
 ## tips
 
 
