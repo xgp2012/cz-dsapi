@@ -558,6 +558,4 @@ browser 引擎单轮 2.2–2.9s（浏览器导航 + DOM 轮询）；直连引擎
 本项目只做协议封装，不是 DeepSeek 官方产品。请遵守其服务条款；账号风险（限流、风控、封禁）由使用者自行承担。
 ## License
 
-This project is licensed under the GNU General Public License v3.0.
-See the [LICENSE](./LICENSE) file for details.
-
+[AGPLv3](./LICENSE)
