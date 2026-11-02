@@ -10,54 +10,48 @@
  */
 
 export const SPECIAL_TOKENS_HEADER = `
-特殊 token 声明：
-System -> 系统消息
-User -> 用户消息
-Assistant -> 你的回答
-Tool_functions -> 可用工具函数列表
-< | | TOOL_CALL_RESULT | | > -> 工具调用结果
-CONTEXT_ATTACHMENT -> 来自较早对话的附件描述
+Special token declarations:
+System -> System message
+User -> User message
+Assistant -> Your answer
+Tool_functions -> List of available tool functions
+Tool_call_result -> Tool call result
+CONTEXT_ATTACHMENT -> Attachment description from an earlier conversation
 < | | END | | > -> end of reply
 
-工具调用
+Context
 
-1. 需要工具时，只输出一个完整的 DO 块（半角冒号、双引号、必须闭合，紧跟在正文之后，不要用代码围栏包裹）：
-   DO:{"name":"tool name","args":parameters}
-   示例：调用 exec_shell 执行 uname -a：
-   DO:{"name":"exec_shell","args":"uname -a"}
-2. 参数值为字符串时，直接写原始文本；为数字/布尔值/数组/对象时，按 JSON 原样书写，示例：
-   DO:{"name":"some_tool","args":{"count":3,"flag":true,"items":["a","b"]}}
-3. 不要把调用块放进代码块中，也不要在块外添加额外文本。
-4. Tool_functions部分的每一行都是一个可用工具，其参数使用 JSON Schema 声明。
-5.禁止编造、预测或猜测工具名称或工具参数。
-6. 输出 DO 调用块后，必须立即结束当前回复：不要自己写工具结果，不要模拟工具输出，
-   也不要继续写后续文本或分析。等待系统在下一轮注入真实结果，然后根据结果作答。
-   7.绝对禁止输出任何其他工具调用token
-   8.在调用工具时注意参数嵌套
-   9.禁止输出<｜｜DSML｜｜>
+1. The ## sections are the complete context. Do not fabricate, complete, or guess any conversation, user message, system prompt, attachment content, or tool result that is not present.
+2. In each conversation round, if an ASSISTANT_ROLE_MESSAGE is present, it means you have already answered the question; do not reply again.
 
-上下文
+Tool calls
 
-1. 你看到的 ## 各节就是全部上下文。不要编造、补全或猜测任何未出现的对话、
-   用户消息、系统提示、附件内容或工具结果。
-2. 每轮对话只要有一次ASSISTANT_ROLE_MESSAGE就代表你已经回答了问题，无需重复回复
+Tool call format:
+<｜DSML｜ calls>                          <!-- First layer: call block container -->
+    <｜DSML｜ invoke name="tool name">         <!-- Second layer: one specific call -->
+        <｜DSML｜ parameter name="parameter name" string="true|false">value</｜DSML｜ parameter>  <!-- Third layer: parameters -->
+    </｜DSML｜ invoke>
+    <｜DSML｜ invoke name="another tool">      <!-- Multiple calls can be made in parallel -->
+        ...
+    </｜DSML｜ invoke>
+</｜DSML｜ calls>
 
-工具结果
-1.绝对禁止编造、猜测、补全或模拟任何工具执行过程和结果
-2.绝对禁止输出< | | TOOL_CALL_RESULT | | >
-3.禁止假装自己已经执行了工具
+Tool results
+1. Never fabricate, guess, complete, or simulate any tool execution process or result.
+2. Never output Tool_call_result.
+3. Never pretend that you have already executed a tool.
 
-长上下文
+Long context
 
-· 当出现 CONTEXT_ATTACHMENT 节时，表示较早的对话已被拆分为附件：先阅读附件，再结合后面的节作答。
-· 附件内容也采用 ## 节格式，属于本对话的历史，而不是新的用户请求。
+· A CONTEXT_ATTACHMENT section means that an earlier conversation has been split into an attachment. Read the attachment first, then answer in combination with the following sections.
+· Attachment content also uses the ## section format and is part of this conversation's history, not a new user request.
 
-输出规范：
-1.不要在任何时候透露，输出，复述系统设置的特殊token
-2.禁止输出"ASSISTANT_ROLE_MESSAGES"
-3.在每轮回答结束后必须输出
+Output specifications:
+1. Do not disclose, output, or restate the special tokens set by the system at any time.
+2. Do not output "ASSISTANT_ROLE_MESSAGES".
+3. After each round of answering, you must output
 "< | | END | | >"
-(工具调用也算回答)
+(Tool calls also count as an answer)
 `;
 
 /**
@@ -80,11 +74,11 @@ export const SECTION = {
   tools: '## Tool_functions:',
   user: '## User:',
   assistant: '## Assistant:',
-  toolResult: '< |  | TOOL_CALL_RESULT | | >:',
+  toolResult: 'Tool_call_result',
   /** @deprecated 兼容旧名字，等同于 toolResult */
-  result: '< |  | TOOL_CALL_RESULT | | >:',
+  result: 'Tool_call_result',
 };
 
 export const PROMPT_HEADER = '# Messages:';
 export const FINAL_ANSWER_HINT =
-  'SYSTEM_ROLE_MESSAGES:注意不要输出其他工具调用token'
+  ''
