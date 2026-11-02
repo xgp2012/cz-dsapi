@@ -10,12 +10,11 @@
  */
 
 export const SPECIAL_TOKENS_HEADER = `
-你是一个拒绝通过xml标签调用工具的助手
 特殊 token 声明：
-SYSTEM_ROLE_MESSAGE -> 系统消息
-USER_ROLE_MESSAGE -> 用户消息
-ASSISTANT_ROLE_MESSAGE -> 你的回答
-TOOL_FUNCTIONS -> 可用工具函数列表
+System -> 系统消息
+User -> 用户消息
+Assistant -> 你的回答
+Tool_functions -> 可用工具函数列表
 < | | TOOL_CALL_RESULT | | > -> 工具调用结果
 CONTEXT_ATTACHMENT -> 来自较早对话的附件描述
 < | | END | | > -> end of reply
@@ -41,9 +40,7 @@ CONTEXT_ATTACHMENT -> 来自较早对话的附件描述
 
 1. 你看到的 ## 各节就是全部上下文。不要编造、补全或猜测任何未出现的对话、
    用户消息、系统提示、附件内容或工具结果。
-2. 不要输出诸如 ## USER_ROLE_MESSAGES / ## < | |ASSISTANT_ROLE_MESSAGES | | > / ## <|TOOL_CALL_RESULT|> /
-   SYSTEM_ROLE_MESSAGES / ## CONTEXT_ATTACHMENT 这样的节标题，也不要输出 # MESSAGES: 标题。
-3. 每轮对话只要有一次ASSISTANT_ROLE_MESSAGE就代表你已经回答了问题，无需重复回复
+2. 每轮对话只要有一次ASSISTANT_ROLE_MESSAGE就代表你已经回答了问题，无需重复回复
 
 工具结果
 1.绝对禁止编造、猜测、补全或模拟任何工具执行过程和结果
@@ -79,15 +76,15 @@ export const STRICT_REPLY_NOTE = `**本次回答的额外约束**：上一条回
 不要输出 RESULT、<|TOOL_CALL_RESULT|>、## 段落标题，也不要编造工具输出或没有出现过的对话。
 没有工具结果时，就基于已有信息用自然语言回答，或者只输出一个完整的 DO:{"name":"工具名","args":参数} 工具调用块。`;
 export const SECTION = {
-  system: '## SYSTEM_ROLE_MESSAGE:',
-  tools: '## TOOL_FUNCTIONS:',
-  user: '## USER_ROLE_MESSAGE:',
-  assistant: '## ASSISTANT_ROLE_MESSAGES:',
+  system: '## System:',
+  tools: '## Tool_functions:',
+  user: '## User:',
+  assistant: '## Assistant:',
   toolResult: '< |  | TOOL_CALL_RESULT | | >:',
   /** @deprecated 兼容旧名字，等同于 toolResult */
   result: '< |  | TOOL_CALL_RESULT | | >:',
 };
 
-export const PROMPT_HEADER = '# MESSAGES:';
+export const PROMPT_HEADER = '# Messages:';
 export const FINAL_ANSWER_HINT =
   'SYSTEM_ROLE_MESSAGES:注意不要输出其他工具调用token'
