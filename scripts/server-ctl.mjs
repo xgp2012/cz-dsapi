@@ -196,10 +196,17 @@ async function status() {
   return 0;
 }
 
-const handlers = { up, down, status, start: up, stop: down };
+async function restart() {
+  // 先停再起：用 SIGTERM 让旧进程自己收尾（关闭浏览器/子进程），再拉新进程。
+  await down();
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  return up();
+}
+
+const handlers = { up, down, status, restart, start: up, stop: down };
 const handler = handlers[action];
 if (!handler) {
-  console.log('用法：node scripts/server-ctl.mjs <up|down|status>');
+  console.log('用法：node scripts/server-ctl.mjs <up|down|restart|status>');
   process.exit(1);
 }
 process.exit(await handler());

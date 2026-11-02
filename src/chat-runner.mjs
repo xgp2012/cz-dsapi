@@ -11,7 +11,7 @@ import {
 import { buildPrompt } from './prompt/build.mjs';
 import { planOverflow } from './prompt/overflow.mjs';
 import { STRICT_REPLY_NOTE } from './prompt/special.mjs';
-import { detectNativeToolCallFormat, parseToolCalls } from './prompt/tools.mjs';
+import { parseToolCalls } from './prompt/tools.mjs';
 
 /**
  * 引擎调用的公共部分：拼 prompt → 图片/超长附件上传 → 调 web.chat → 解析工具调用。
@@ -74,31 +74,16 @@ export function createChatRunner({ config, log, web }) {
     /**
      * 把一段原始输出整理成协议无关的语义：有效工具调用 + 干净正文。
      *
-     * 「保护工具调用 token」：模型偶尔会绕过 DO，原生吐 DSML / <tool_call> / <|tool…|>，
-     * 解析层会静默救回；这里只负责把「漏了原生格式」这件事记进日志。
+     * 模型输出的工具调用走原生 DSML（唯一协议），解析层转成标准 tool_calls；
+     * 其他历史格式（<tool_call> / 原生 token / 旧版 DO）只做静默兜底，不再记日志。
      */
     const evaluate = (text) => {
       const toolCalls = suppressRepeatedToolCalls(parseToolCalls(text, knownTools), request.messages);
-      const nativeFormat = detectNativeToolCallFormat(text);
-      if (nativeFormat) {
-        const payload = { format: nativeFormat, toolCalls: toolCalls.length };
-        if (toolCalls.length) {
-          log?.warn?.('模型输出了原生工具调用格式，已静默救回为 tool_calls', payload);
-        } else {
-          // 解析层没救回来：这是最危险的情况，保留原文片段方便排查（服务日志）
-          log?.error?.('模型输出了原生工具调用格式但没能解析出调用', {
-            ...payload,
-            sample: String(text || '').slice(0, 400),
-          });
-        }
-      }
       return {
         toolCalls,
         content: stripToolMarkup(text),
         // RESULT / 伪造的 ## 段落标题都算「编造协议」
         fabricated: hasFabricatedProtocol(text),
-        // 这一轮漏出的原生工具调用格式（'dsml' | 'xml' | 'native' | null）
-        nativeFormat,
       };
     };
 
@@ -170,13 +155,12 @@ export function createChatRunner({ config, log, web }) {
         });
       }
 
-      // 只出现 RESULT / 原生工具调用格式、却没有真的解析出调用：说明这一轮要么在编造结果，
-      // 要么丢了一个本可以救回的工具调用。带上更硬的约束重来一次（流式已发出去的内容不回滚，只清洗）。
+      // 只出现 RESULT、却没有真的解析出调用：说明这一轮在编造工具结果。
+      // 带上更硬的约束重来一次（流式已发出去的内容不回滚，只清洗）。
       // 已经因为编造协议提前终止生成时不再重试：再生成一次只会更慢，而且大概率还是会编。
-      const lostNativeCall = Boolean(reply.nativeFormat) && !reply.toolCalls.length;
       if (
         !stoppedForFabrication &&
-        (reply.fabricated || lostNativeCall) &&
+        reply.fabricated &&
         !reply.toolCalls.length &&
         config.runtime.retryOnFabrication
       ) {

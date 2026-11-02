@@ -1,6 +1,7 @@
 import http from 'node:http';
 
 import { ApiError } from './errors.mjs';
+import { createAdminHandler } from './admin/routes.mjs';
 import { createChatRunner } from './chat-runner.mjs';
 import { createAnthropicHandler } from './anthropic/handler.mjs';
 import { anthropicErrorPayload } from './anthropic/response.mjs';
@@ -31,6 +32,8 @@ export function createServer({ config, logger, web }) {
   /** 两个协议共用同一套执行逻辑（防自造结果 / 超长转附件） */
   const runChat = createChatRunner({ config, log, web });
   const anthropic = createAnthropicHandler({ config, log, runChat, sendJson });
+  /** 网页控制台：/admin 静态页 + /admin/api/* 管理接口 */
+  const admin = createAdminHandler({ config, logger, web });
 
   async function handle(req, res) {
     const started = Date.now();
@@ -67,6 +70,11 @@ export function createServer({ config, logger, web }) {
 
       if (req.method === 'GET' && url.pathname === '/') {
         return sendHtml(res, 200, landingPage(config));
+      }
+
+      // ---- 网页控制台（/admin 静态页，/admin/api/* 管理接口）----
+      if (url.pathname === '/admin' || url.pathname.startsWith('/admin/')) {
+        return admin(req, res, url);
       }
 
       if (req.method === 'GET' && url.pathname === '/v1/models') {
@@ -423,7 +431,8 @@ td,th{border:1px solid #e5e7eb;padding:6px 10px;text-align:left;font-size:14px}
 th{background:#f6f8fa}
 </style>
 <h1>DeepSeek 网页版 → OpenAI / Anthropic 兼容 API</h1>
-<p>服务地址：<code>http://${escapeHtml(config.server.host)}:${config.server.port}/v1</code></p>
+<p>服务地址：<code>http://${escapeHtml(config.server.host)}:${config.server.port}/v1</code>
+&nbsp;·&nbsp;<a href="/admin/">打开网页控制台 →</a></p>
 <table>
 <tr><th>接口</th><th>说明</th></tr>
 <tr><td><code>POST /v1/chat/completions</code></td><td>OpenAI 聊天补全（支持 stream / tools）</td></tr>
@@ -433,7 +442,7 @@ th{background:#f6f8fa}
 <tr><td><code>GET /v1/models</code></td><td>模型列表</td></tr>
 <tr><td><code>GET /healthz</code></td><td>健康检查 / 浏览器状态</td></tr>
 </table>
-<p>每条消息都会新开一个 DeepSeek 网页对话，历史上下文拼在同一个 prompt 里（<code>## USER_ROLE_MESSAGES</code> / <code>## ASSISTANT_ROLE_MESSAGES</code>）。</p>
+<p>每条消息都会新开一个 DeepSeek 网页对话，历史上下文拼在同一个 prompt 里（<code>## User</code> / <code>## Assistant</code> / <code>## Tool_calls</code> / <code>## Tool_call_result</code>）；工具调用由模型按原生 DSML 输出，服务端解析成标准 <code>tool_calls</code>。</p>
 <pre>${escapeHtml(example)}</pre>
 <pre>${escapeHtml(anthropicExample)}</pre>
 <p style="color:#6b7280">登录态：${config.deepseek.token ? '已配置 ✅' : '未配置 ❌ 执行 npm run auth -- &lt;userToken&gt;'}</p>

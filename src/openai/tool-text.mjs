@@ -25,12 +25,16 @@ const TOOL_RESULT_HEADER = /^[ \t]{0,3}(?:#{1,4}[ \t]*)?TOOL_RESULT_MESSAGES[ \t
 const TOOL_FUNCTIONS_HEADER = /^[ \t]{0,3}(?:#{1,4}[ \t]*)?TOOL_FUNCTIONS[ \t]*[:：]?[ \t]*$/gimu;
 const CONTEXT_HEADER = /^[ \t]{0,3}(?:#{1,4}[ \t]*)?CONTEXT_ATTACHMENT[ \t]*[:：]?[ \t]*$/gimu;
 const PROMPT_HEADER_LINE = /^[ \t]{0,3}#{1,4}[ \t]*MESSAGES[ \t]*[:：]?[ \t]*$/gimu;
+/** 新协议的段标题：## System: / ## User: / ## Tool_calls: / ## Tool_call_result: 之类 */
+const PROTOCOL_HEADER =
+  /^[ \t]{0,3}#{1,4}[ \t]*(?:System|User|Assistant|Tool_calls|Tool_call_result|Tool_functions|CONTEXT_ATTACHMENT|Messages)[ \t]*[:：]?[ \t]*$/gimu;
 const SECTION_PATTERNS = [
   SECTION_HEADER,
   TOOL_RESULT_HEADER,
   TOOL_FUNCTIONS_HEADER,
   CONTEXT_HEADER,
   PROMPT_HEADER_LINE,
+  PROTOCOL_HEADER,
 ];
 /** 冒号后面的装饰符（空格 / 加粗 / 反引号），payload 从这之后开始 */
 const AFTER_LABEL_DECOR = /[ \t*_`~]/;
@@ -450,13 +454,18 @@ export function suppressRepeatedToolCalls(calls, messages = []) {
 
 /** 段落标题的「可能前缀」：整行还没写完时先扣住，避免半截标题漏进正文 */
 const SECTION_PHRASES = [
+  'SYSTEM',
+  'USER',
+  'ASSISTANT',
+  'TOOL_CALLS',
+  'TOOL_CALL_RESULT',
+  'TOOL_FUNCTIONS',
+  'CONTEXT_ATTACHMENT',
+  'MESSAGES',
   'SYSTEM_ROLE_MESSAGES',
   'USER_ROLE_MESSAGES',
   'ASSISTANT_ROLE_MESSAGES',
   'TOOL_RESULT_MESSAGES',
-  'TOOL_FUNCTIONS',
-  'CONTEXT_ATTACHMENT',
-  'MESSAGES',
 ];
 
 /**
@@ -496,20 +505,22 @@ function pendingProtocolStart(text, from) {
   const lineStart = text.lastIndexOf('\n') + 1;
   if (lineStart >= start) {
     const line = text.slice(lineStart);
+    // 只有 markdown 标题行（# / ## …）才可能是协议段标题，
+    // 否则正文里以 "System: ..." 开头的普通句子会被整行扣住不发。
+    const isHeading = /^[ \t]{0,3}#{1,4}[ \t]*\S/.test(line);
     const stripped = line
       .replace(/^[ \t]{0,3}(?:#{1,4}[ \t]*)?/, '')
       .replace(/[*_`~ \t]+/g, '');
     const upper = stripped.toUpperCase();
-    if (!upper || SECTION_PHRASES.some((phrase) => phrase.startsWith(upper) || upper.startsWith(phrase))) {
-      candidates.push(lineStart);
-    }
+    const isPhrase = !upper || SECTION_PHRASES.some((phrase) => phrase.startsWith(upper) || upper.startsWith(phrase));
+    if (isPhrase && (isHeading || !upper)) candidates.push(lineStart);
   }
 
   return candidates.length ? Math.min(...candidates) : -1;
 }
 
 /**
- * 流式过滤器：把 content 里的 DO:/RESULT: 块挡在 SSE 之外。
+ * 流式过滤器：把 content 里的 RESULT / 协议段标题挡在 SSE 之外。
  * 先发正文，遇到协议行就停；最后再按「有没有解析出工具调用」决定是否把后面的正文补上。
  *
  * holdBack 必须大于最长的「协议前缀」——但只有 holdBack 还不够：DO 的 JSON 参数可能很长，

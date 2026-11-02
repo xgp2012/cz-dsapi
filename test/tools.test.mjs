@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 
 import {
   collectToolNames,
-  detectNativeToolCallFormat,
   normalizeArguments,
   parseToolCalls,
   readJsonObject,
@@ -87,9 +86,9 @@ test('render: 工具声明忽略没有名字的项', () => {
   assert.equal(JSON.parse(lines[1]).name, 'b');
 });
 
-test('render: RESULT 行', () => {
+test('render: Tool_call_result 段的一行 JSON', () => {
   const line = renderToolResult('exec_shell', 'Linux');
-  const parsed = JSON.parse(line.slice('RESULT:'.length));
+  const parsed = JSON.parse(line);
   assert.deepEqual(parsed, { name: 'exec_shell', result: 'Linux' });
 });
 
@@ -116,7 +115,7 @@ test('parse: 被包成 {name,args} 的参数会自动拆开', () => {
   assert.deepEqual(JSON.parse(doString[0].arguments), { description: 'show cwd', command: 'pwd' });
 });
 
-test('parse: DSML 参数被命名成 name/args 时也能救回', () => {
+test('parse: DSML 参数被命名成 name/args 时也能解析', () => {
   const text = `<｜DSML｜calls>
 <｜DSML｜invoke name="bash">
 <｜DSML｜parameter name="name" string="true">bash</｜DSML｜parameter>
@@ -292,7 +291,7 @@ test('parse: <tool_calls> 复数标签 + OpenAI 风格 function 包裹也能认'
   assert.deepEqual(JSON.parse(calls[0].arguments), { path: '/etc/hosts' });
 });
 
-test('parse: 原生 <|tool...|> token 包裹的 JSON 能静默救回', () => {
+test('parse: 原生 <|tool...|> token 包裹的 JSON 也能解析', () => {
   const text =
     '<|tool▁calls▁begin|><|tool▁call▁begin|>{"name":"exec_shell","arguments":{"command":"uname -a"}}<|tool▁call▁end|><|tool▁calls▁end|>';
   const calls = parseToolCalls(text, ['exec_shell']);
@@ -303,7 +302,7 @@ test('parse: 原生 <|tool...|> token 包裹的 JSON 能静默救回', () => {
   assert.ok(!calls[0].name.includes('<|'));
 });
 
-test('parse: 真·原生格式 function<sep>工具名 + JSON 参数也能救回', () => {
+test('parse: 真·原生格式 function<sep>工具名 + JSON 参数也能解析', () => {
   const text =
     '<|tool▁calls▁begin|><|tool▁call▁begin|>function<|tool▁sep|>get_weather\n```json\n{"location":"Hangzhou"}\n```<|tool▁call▁end|><|tool▁calls▁end|>';
   const calls = parseToolCalls(text, ['get_weather']);
@@ -323,31 +322,4 @@ test('parse: 原生 token / DSML / DO 混用不会重复', () => {
     calls.map((c) => c.name),
     ['exec_shell', 'bash'],
   );
-});
-
-// ---------------------------------------------------------------- detectNativeToolCallFormat
-
-test('detectNativeToolCallFormat: 普通正文 / 纯 DO → null', () => {
-  assert.equal(detectNativeToolCallFormat('普通回答，没有工具。'), null);
-  assert.equal(detectNativeToolCallFormat('DO:{"name":"exec_shell","args":"ls"}'), null);
-  assert.equal(detectNativeToolCallFormat(''), null);
-  assert.equal(detectNativeToolCallFormat(undefined), null);
-});
-
-test('detectNativeToolCallFormat: DSML / XML / 原生 token 都能识别', () => {
-  assert.equal(detectNativeToolCallFormat(DSML_FULLWIDTH), 'dsml');
-  // 半角竖线、没闭合的截断 DSML 也算
-  assert.equal(detectNativeToolCallFormat('<|DSML|invoke name="bash"><|DSML|parameter name="command">pwd'), 'dsml');
-  assert.equal(detectNativeToolCallFormat('<tool_call>{"name":"x","arguments":{}}</tool_call>'), 'xml');
-  assert.equal(
-    detectNativeToolCallFormat('<|tool▁calls▁begin|>{"name":"exec_shell","arguments":{"command":"ls"}}<|tool▁calls▁end|>'),
-    'native',
-  );
-});
-
-test('detectNativeToolCallFormat: 多种格式混用时按最先出现的报告', () => {
-  const xmlFirst = `<tool_call>{"name":"a","arguments":{}}</tool_call>\n${DSML_FULLWIDTH}`;
-  assert.equal(detectNativeToolCallFormat(xmlFirst), 'xml');
-  const nativeFirst = `<|tool▁calls▁begin|>{"name":"a","arguments":{}}<|tool▁calls▁end|>\n${DSML_FULLWIDTH}`;
-  assert.equal(detectNativeToolCallFormat(nativeFirst), 'native');
 });

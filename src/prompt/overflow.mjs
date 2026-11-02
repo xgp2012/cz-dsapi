@@ -6,26 +6,35 @@ import { PromptTooLongError } from '../errors.mjs';
  * 超长上下文 → 附件注入。
  *
  * 网页版输入框单次最多 10 万字（超了接口直接报错）。但聊天接口的 `ref_file_ids`
- * 可以挂附件，而附件不占输入框长度，所以把「较早的对话」拆成一个 .txt 传上去，
- * 正文只保留 system + 工具声明 + 最近的段落，再在正文里放一段说明。
+ * 可以挂附件，而附件不占输入框长度，所以把「较早的内容」拆成一个 .txt 传上去：
+ *
+ *   正文 = # Messages: + 自带协议提示词（## System:）+ 附件说明 + 最近的段落
+ *   附件 = 较早的对话 / 工具声明 / 客户端 system（按原顺序）
  *
  * 拆分原则：
- * - 只切在 ## USER/ASSISTANT/TOOL_RESULT 段落边界上，不切碎单条消息；
+ * - 只切在 ## System / Tool_functions / User / Assistant / Tool_calls / Tool_call_result 段落边界上，
+ *   不切碎单条消息；
+ * - **自带协议提示词永远留在正文**：模型要先看到工具调用格式约定；
  * - 保留**最新的**段落（真正要回答的问题在最后），较早的进附件；
+ * - 空间不够时，连工具声明和客户端 system 提示也可以移进附件（先移最靠前的）；
  * - 万一最后一段自己就超长，保留它的尾部，前面部分进附件；
  * - 正文再留一点余量（reserve），给重试时的额外约束文案用。
  */
 
-const SECTION_START = /\n## (?:USER_ROLE_MESSAGES:|ASSISTANT_ROLE_MESSAGES:|<|TOOL_CALL_RESULT|>:)/g;
+/** 段边界：## X: 前面那个换行属于上一段的结尾，切在这里 */
+const BLOCK_BOUNDARY = /\n## (System|Tool_functions|User|Assistant|Tool_calls|Tool_call_result):/g;
+const DIALOG_KINDS = new Set(['User', 'Assistant', 'Tool_calls', 'Tool_call_result']);
 
 const DEFAULT_RESERVE = 1024;
+/** 正文里至少给最新对话留这么多字符，不够就把 system / 工具声明往附件挪 */
+const DEFAULT_MIN_DIALOG_CHARS = 1500;
 const NAME_PREFIX = 'context-';
 /** 固定长度的占位文件名：先按它算预算，最后换成真实 hash 名，长度不变 */
 const PLACEHOLDER = `${NAME_PREFIX}00000000.txt`;
 
 /**
  * @param {string} prompt buildPrompt 生成的完整 prompt
- * @param {{ maxChars?: number, maxAttachmentChars?: number, reserve?: number }} [options]
+ * @param {{ maxChars?: number, maxAttachmentChars?: number, reserve?: number, minDialogChars?: number }} [options]
  * @returns {{ prompt: string, attachment: null | { name: string, mime: string, buffer: Buffer, chars: number, sections: number } }}
  */
 export function planOverflow(prompt, options = {}) {
@@ -33,74 +42,89 @@ export function planOverflow(prompt, options = {}) {
     maxChars = 100_000,
     maxAttachmentChars = 2_000_000,
     reserve = DEFAULT_RESERVE,
+    minDialogChars = DEFAULT_MIN_DIALOG_CHARS,
   } = options;
 
   if (prompt.length <= maxChars) return { prompt, attachment: null };
 
-  // 找到第一段对话的起点；system / TOOL_FUNCTIONS 必须留在正文里
-  SECTION_START.lastIndex = 0;
-  const first = SECTION_START.exec(prompt);
-  if (!first) {
+  const parsed = splitBlocks(prompt);
+  if (!parsed) {
     throw new PromptTooLongError(
-      `prompt 有 ${prompt.length} 字符，超过上限 ${maxChars}，且没有可拆分的对话段落（system / 工具声明本身过长）`,
+      `prompt 有 ${prompt.length} 字符，超过上限 ${maxChars}，但找不到可拆分的 ## 段落`,
     );
   }
 
-  const head = prompt.slice(0, first.index);
-  const sections = [];
-  SECTION_START.lastIndex = first.index + 1;
-  let match;
-  let start = first.index;
-  while ((match = SECTION_START.exec(prompt)) !== null) {
-    sections.push(prompt.slice(start, match.index));
-    start = match.index;
+  const { header, headBlocks, protocol, dialogs } = parsed;
+  if (!dialogs.length) {
+    throw new PromptTooLongError(
+      `prompt 有 ${prompt.length} 字符，超过上限 ${maxChars}，且只有 system / 工具声明，没有可拆分的对话段落`,
+    );
   }
-  sections.push(prompt.slice(start));
 
-  const budget = maxChars - reserve - head.length - buildNote(PLACEHOLDER, sections.length).length;
+  const noteLength = buildNote(PLACEHOLDER, dialogs.length).length;
+  /** 已移进附件的块（保持原始顺序，先 head 后 dialog） */
+  const removed = [];
+  let movedHead = 0;
+
+  const budgetNow = () => {
+    const inlineHead =
+      header.length +
+      protocol.text.length +
+      headBlocks.slice(movedHead).reduce((sum, block) => sum + block.text.length, 0);
+    return maxChars - reserve - inlineHead - noteLength;
+  };
+
+  // 自带协议提示词之后的 system / 工具声明：正文空间不够时按从前往后的顺序挪进附件
+  while (movedHead < headBlocks.length && budgetNow() < minDialogChars) {
+    removed.push(headBlocks[movedHead]);
+    movedHead += 1;
+  }
+
+  const budget = budgetNow();
   if (budget <= 0) {
     throw new PromptTooLongError(
-      `system + 工具声明已占 ${head.length} 字符（上限 ${maxChars}），没有空间保留对话内容`,
+      `system / 工具声明太长：正文可用空间只剩 ${budget} 字符（上限 ${maxChars}），无法保留任何对话内容`,
     );
   }
 
-  // 从后往前尽可能多地保留整段
-  let keepFrom = sections.length;
+  // 从后往前尽可能多地保留整段对话
+  let keepFrom = dialogs.length;
   let keptChars = 0;
-  for (let i = sections.length - 1; i >= 0; i -= 1) {
-    if (keptChars + sections[i].length > budget) break;
-    keptChars += sections[i].length;
+  for (let i = dialogs.length - 1; i >= 0; i -= 1) {
+    if (keptChars + dialogs[i].text.length > budget) break;
+    keptChars += dialogs[i].text.length;
     keepFrom = i;
   }
+  removed.push(...dialogs.slice(0, keepFrom));
 
   let attachmentBody;
   let makeTail;
   let removedCount;
 
-  if (keepFrom === sections.length) {
-    // 最后一段自己就超预算：保留尾部，前面进附件
-    const last = sections.at(-1);
-    const headerEnd = last.indexOf('\n', 1);
-    const header = headerEnd === -1 ? '' : last.slice(0, headerEnd);
-    const body = headerEnd === -1 ? last : last.slice(headerEnd);
+  if (keepFrom === dialogs.length) {
+    // 最新一段自己就超预算：保留尾部，前面进附件
+    const last = dialogs.at(-1);
+    const headerEnd = last.text.indexOf('\n', 1);
+    const sectionHeader = headerEnd === -1 ? '' : last.text.slice(0, headerEnd);
+    const body = headerEnd === -1 ? last.text : last.text.slice(headerEnd);
     // 用最大的 cut 位数估 marker 长度，宁保守勿超限
     const markerMax = buildMarker(PLACEHOLDER, body.length).length;
-    const keep = budget - header.length - markerMax;
+    const keep = budget - sectionHeader.length - markerMax;
     if (keep < 200) {
       throw new PromptTooLongError(
-        `最后一段有 ${last.length} 字符，超过正文可用空间 ${budget}，无法拆分`,
+        `最后一段有 ${last.text.length} 字符，超过正文可用空间 ${budget}，无法拆分`,
       );
     }
     let cut = Math.max(0, body.length - keep);
     const line = body.indexOf('\n', cut);
     if (line !== -1 && line - cut < 200) cut = line + 1;
-    attachmentBody = sections.slice(0, -1).join('') + header + body.slice(0, cut);
-    removedCount = sections.length;
-    makeTail = (name) => `${header}${buildMarker(name, cut)}${body.slice(cut)}`;
+    attachmentBody = `${removed.map((block) => block.text).join('')}${sectionHeader}${body.slice(0, cut)}`;
+    removedCount = removed.length + 1;
+    makeTail = (name) => `${sectionHeader}${buildMarker(name, cut)}${body.slice(cut)}`;
   } else {
-    attachmentBody = sections.slice(0, keepFrom).join('');
-    removedCount = keepFrom;
-    makeTail = () => sections.slice(keepFrom).join('');
+    attachmentBody = removed.map((block) => block.text).join('');
+    removedCount = removed.length;
+    makeTail = () => dialogs.slice(keepFrom).map((block) => block.text).join('');
   }
 
   if (!attachmentBody.trim()) {
@@ -116,7 +140,7 @@ export function planOverflow(prompt, options = {}) {
   const attachmentText = `${buildAttachmentTitle(removedCount)}${attachmentBody}`;
   const name = fileNameFor(attachmentText);
   const note = buildNote(name, removedCount);
-  const inline = `${head}${note}${makeTail(name)}`;
+  const inline = `${header}${protocol.text}${note}${makeTail(name)}`;
 
   if (inline.length > maxChars) {
     throw new PromptTooLongError(
@@ -136,6 +160,46 @@ export function planOverflow(prompt, options = {}) {
   };
 }
 
+/**
+ * 把 prompt 切成「头部 + system/工具声明块 + 自带协议块 + 对话段」。
+ * 自带协议块 = 第一个对话段之前、最后一个 ## System:（buildPrompt 固定把它放在这个位置）。
+ */
+function splitBlocks(prompt) {
+  const starts = [];
+  BLOCK_BOUNDARY.lastIndex = 0;
+  let match;
+  while ((match = BLOCK_BOUNDARY.exec(prompt)) !== null) {
+    starts.push({ index: match.index, kind: match[1] });
+  }
+  if (!starts.length) return null;
+
+  const header = prompt.slice(0, starts[0].index);
+  const blocks = starts.map((item, i) => ({
+    kind: item.kind,
+    text: prompt.slice(item.index, i + 1 < starts.length ? starts[i + 1].index : prompt.length),
+  }));
+
+  const firstDialog = blocks.findIndex((block) => DIALOG_KINDS.has(block.kind));
+  const headEnd = firstDialog === -1 ? blocks.length : firstDialog;
+
+  let protocolIndex = -1;
+  for (let i = headEnd - 1; i >= 0; i -= 1) {
+    if (blocks[i].kind === 'System') {
+      protocolIndex = i;
+      break;
+    }
+  }
+  if (protocolIndex === -1) return null;
+
+  return {
+    header,
+    // 协议块之前的 system / 工具声明（按原顺序；空块丢掉）
+    headBlocks: blocks.slice(0, protocolIndex).filter((block) => block.text.trim()),
+    protocol: blocks[protocolIndex],
+    dialogs: firstDialog === -1 ? [] : blocks.slice(firstDialog),
+  };
+}
+
 function fileNameFor(text) {
   const hash = crypto.createHash('sha256').update(text).digest('hex').slice(0, 8);
   return `${NAME_PREFIX}${hash}.txt`;
@@ -145,8 +209,8 @@ function buildNote(name, sections) {
   return [
     '',
     '## CONTEXT_ATTACHMENT:',
-    `本次上下文较长，较早的 ${sections} 段对话已作为附件「${name}」上传。`,
-    '附件使用与正文相同的 ## 段落格式（USER_ROLE_MESSAGES / ASSISTANT_ROLE_MESSAGES / <|TOOL_CALL_RESULT|>）。',
+    `本次上下文较长，较早的 ${sections} 个段落已作为附件「${name}」上传（可能包含系统提示、工具声明或早期对话）。`,
+    '附件使用与正文相同的 ## 段落格式（## System: / ## User: / ## Assistant: / ## Tool_calls: / ## Tool_call_result:）。',
     '请先阅读附件，把它当作本次对话的早期历史，再接续下面的段落回答。不要向用户提及附件或本说明。',
     '',
   ].join('\n');
@@ -160,8 +224,8 @@ function buildAttachmentTitle(sections) {
   return [
     '# 对话历史（较早部分）',
     '',
-    `这是本次对话中较早的 ${sections} 段，因为超出网页输入框长度上限，被拆到本文件。`,
-    '段落格式与正文一致：## USER_ROLE_MESSAGES / ## ASSISTANT_ROLE_MESSAGES / ## <|TOOL_CALL_RESULT|>。',
+    `这是本次对话中较早的 ${sections} 个段落，因为超出网页输入框长度上限，被拆到本文件。`,
+    '段落格式与正文一致：## System: / ## Tool_functions: / ## User: / ## Assistant: / ## Tool_calls: / ## Tool_call_result:。',
     '',
   ].join('\n');
 }

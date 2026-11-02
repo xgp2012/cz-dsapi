@@ -1,17 +1,15 @@
 /**
  * 工具声明 / 调用解析。
  *
- * 约定（与网页 prompt 中的 TOOL_FUNCTIONS 段落一致）：
- *   TOOL_FUNCTIONS:
+ * 约定（与网页 prompt 中的 ## Tool_functions 段落一致）：
  *   {"name":"exec_shell","description":"Exec shell command","parameters":{...}}
  *
- * 对外协议只有一种，prompt / 历史 / 文档里也只教、只展示这一种：
- *   DO:{"name":"exec_shell","args":"ls"}
+ * 模型输出工具调用只走一种语法：**原生 DSML**（XML 风格调用，见 dsml.mjs）。
+ * 解析层把它转成标准 tool_calls / tool_use，再从 content / SSE 里剔除；
+ * 历史里绝不回写 DSML，只写 ## Tool_calls 段的 JSON 行。
  *
- * 但模型偶尔会绕过 DO，原生吐出 DSML（XML 风格工具调用）、<tool_call> JSON，
- * 或者 <|tool▁calls▁begin|> 这类原生工具 token。这些属于「模型输出」而不是对外协议：
- * 解析层必须静默救回成 tool_calls（绝不能丢调用），同时绝不把它们回写进历史。
- * detectNativeToolCallFormat 只负责告诉上层这一轮漏出来的是哪种原生格式，用于记 warn。
+ * 为了不丢调用，<tool_call> JSON 和 <|tool▁calls▁begin|> 这类原生工具 token 仍然静默兜底解析，
+ * 但不再区分、也不再记日志（它们不是对外协议，只是容错）。
  */
 
 import { parseDsmlCalls } from './dsml.mjs';
@@ -55,11 +53,10 @@ export function readJsonObject(text, start) {
 }
 
 /**
- * 模型经常把协议写得比约定更花：
- * - `DO :` / 全角冒号 / `**DO:**` 这类行首装饰
- * - 冒号后面换行，再接一段 pretty JSON
- * - 调用夹在正文中间，JSON 后面还跟着正文
- * 这些都要认，否则就是一次被吞掉的工具调用。
+ * 旧版 DO 行（`DO:{"name":...}`）的容错解析。
+ *
+ * 新协议里 prompt / 历史都不再出现 DO（历史调用走 ## Tool_calls 的 JSON 行），
+ * 这里保留只是兜底：万一模型/旧客户端还吐 DO，不丢调用、也不报错、不记日志。
  */
 const DO_PATTERN = /\bDO\b[ \t*_`~]{0,6}[:：=][ \t*_`~]{0,6}\s*/g;
 
@@ -70,9 +67,6 @@ const XML_TOOL_PATTERN = /<tool_calls?\b[^>]*>([\s\S]*?)(?:<\/tool_calls?>|$)/gi
 const NATIVE_TOKEN_SOURCE = '<\\|[^|<>\\r\\n]{0,64}tool[^|<>\\r\\n]{0,64}\\|>';
 const NATIVE_TOKEN_PATTERN = new RegExp(NATIVE_TOKEN_SOURCE, 'gi');
 const NATIVE_TOKEN_AT = new RegExp(`^(?:${NATIVE_TOKEN_SOURCE})`, 'i');
-
-/** DSML 标签开头（全角 / 半角竖线；带 attribute、标签没闭合都算） */
-const DSML_MARKER = /<[ \t]*(?:\/)?[ \t]*[|｜][ \t]*(?:[|｜][ \t]*)?DSML/iu;
 
 /** 参数对象键排序后再序列化，方便不同格式的等价调用去重 / 比较 */
 export function canonicalArguments(args) {
@@ -258,8 +252,9 @@ function parseNativeToolCalls(text, add) {
 /**
  * 解析模型回复中的工具调用。
  *
- * 顺序：DO（唯一对外协议）→ DSML → <tool_call> → 原生 token；最终按出现位置排序，
- * 用 canonicalArguments 去重（同一次调用被模型用两种格式重复写出来时只保留一次）。
+ * 顺序：DSML（唯一对外语法）→ <tool_call> → 原生 token → 旧版 DO 兜底；
+ * 最终按出现位置排序，用 canonicalArguments 去重
+ * （同一次调用被模型用两种格式重复写出来时只保留一次）。
  *
  * @param {string} text
  * @param {string[]} [knownTools] 已知工具名，用于过滤误伤
@@ -281,7 +276,24 @@ export function parseToolCalls(text, knownTools = null) {
     calls.push({ name, arguments: argsJson, raw, index });
   };
 
-  // 1) DO：唯一对外协议
+  // 1) DSML：唯一对外语法（全角 / 半角竖线、截断都能解析）
+  for (const call of parseDsmlCalls(text, allowed)) {
+    add(call.name, call.arguments, call.raw, call.index);
+  }
+
+  // 2) <tool_call>{...}</tool_call>：缺闭合标签时按截断处理
+  XML_TOOL_PATTERN.lastIndex = 0;
+  let xml;
+  while ((xml = XML_TOOL_PATTERN.exec(text)) !== null) {
+    const call = parseToolCallBody(xml[1]);
+    if (!call) continue;
+    add(call.name, call.args, xml[0], xml.index);
+  }
+
+  // 3) 原生工具 token（<|tool▁calls▁begin|> 之类）兜底
+  parseNativeToolCalls(text, add);
+
+  // 4) 旧版 DO 行：只做静默兜底，不记日志、不回写历史
   DO_PATTERN.lastIndex = 0;
   let match;
   while ((match = DO_PATTERN.exec(text)) !== null) {
@@ -291,28 +303,11 @@ export function parseToolCalls(text, knownTools = null) {
     add(call.name, call.args, `DO:${raw}`, match.index);
   }
 
-  // 2) DSML：模型原生吐出的 XML 风格调用（全角 / 半角竖线、截断都能救）
-  for (const call of parseDsmlCalls(text, allowed)) {
-    add(call.name, call.arguments, call.raw, call.index);
-  }
-
-  // 3) <tool_call>{...}</tool_call>：缺闭合标签时按截断处理
-  XML_TOOL_PATTERN.lastIndex = 0;
-  let xml;
-  while ((xml = XML_TOOL_PATTERN.exec(text)) !== null) {
-    const call = parseToolCallBody(xml[1]);
-    if (!call) continue;
-    add(call.name, call.args, xml[0], xml.index);
-  }
-
-  // 4) 原生工具 token（<|tool▁calls▁begin|> 之类）最后兜底
-  parseNativeToolCalls(text, add);
-
   return calls.sort((a, b) => a.index - b.index);
 }
 
 /**
- * 有些模型在原生格式（DSML / <tool_call> / 原生 token）里会把 DO 的包装对象原样塞进参数：
+ * 有些模型在原生格式（DSML / <tool_call> / 原生 token / 旧版 DO）里会把包装对象原样塞进参数：
  *
  *   {"name":"bash","args":{"description":"...","command":"..."}}
  *   {"name":"bash","args":"{\"description\":...,\"command\":...}"}
@@ -361,35 +356,7 @@ export function normalizeArguments(args) {
   return JSON.stringify(unwrapCallArguments(value));
 }
 
-/**
- * 模型这一轮漏出了哪种「非 DO」的原生工具调用格式（用于记 warn，不影响解析结果）。
- * 多种同时出现时，按在正文里最先出现的那种报告。
- *
- * @param {string} text
- * @returns {'dsml'|'xml'|'native'|null}
- */
-export function detectNativeToolCallFormat(text) {
-  if (!text || typeof text !== 'string') return null;
-
-  const candidates = [];
-
-  // DSML：标签没闭合（流式截断 / 只吐了半个参数）也算，说明模型正在漏原生格式
-  const dsml = DSML_MARKER.exec(text);
-  if (dsml) candidates.push({ kind: 'dsml', index: dsml.index });
-
-  const xml = /<tool_calls?\b/i.exec(text);
-  if (xml) candidates.push({ kind: 'xml', index: xml.index });
-
-  NATIVE_TOKEN_PATTERN.lastIndex = 0;
-  const native = NATIVE_TOKEN_PATTERN.exec(text);
-  if (native) candidates.push({ kind: 'native', index: native.index });
-
-  if (!candidates.length) return null;
-  const first = candidates.reduce((best, item) => (item.index < best.index ? item : best));
-  return first.kind;
-}
-
-/** 工具执行结果 -> prompt 里的 RESULT 行 */
+/** 工具执行结果 -> ## Tool_call_result 段里的一行 JSON */
 export function renderToolResult(name, content) {
   const result = typeof content === 'string' ? content : JSON.stringify(content);
   return `${JSON.stringify({ name: name || 'unknown', result })}`;

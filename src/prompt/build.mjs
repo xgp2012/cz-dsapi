@@ -10,32 +10,38 @@ const VALID_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool',
  *
  * 输出形状（一次请求 = 一次全新对话，模型只能靠这些段落判断上下文）：
  *
- *   MESSAGES:
- *   SYSTEM_ROLE_MESSAGES:
+ *   # Messages:
+ *   ## System:
  *   <调用方传入的 system（客户端 prompt 最上面）>
  *
- *   <自带的特殊 token 声明 / DO 规范（放中间）>
- *
- *   TOOL_FUNCTIONS:
+ *   ## Tool_functions:
  *   {"name":"exec_shell","description":"..."}
  *
- *   USER_ROLE_MESSAGES:
+ *   ## System:
+ *   <自带的特殊 token 声明 / DSML 工具调用规范（放中间）>
+ *
+ *   ## User:
  *   你好
  *
- *   ASSISTANT_ROLE_MESSAGES:
+ *   ## Assistant:
  *   你好！有什么可以帮你？
  *
- *   TOOL_CALL_RESULT:
- *   RESULT:{"name":"exec_shell","result":"Linux"}
+ *   ## Tool_calls:
+ *   {"name":"exec_shell","args":{"command":"uname -a"}}
  *
- *   USER_ROLE_MESSAGES:
+ *   ## Tool_call_result:
+ *   {"name":"exec_shell","result":"Linux"}
+ *
+ *   ## User:
  *   解释一下
  *
  * 顺序：客户端 system 在最上面，自带协议提示词夹在中间，工具声明和对话历史（user）在后面。
  *
- * 注意工具结果的归属：它**单独成段**，不塞进 ASSISTANT_ROLE_MESSAGES。
- * 模型看到的历史里，自己的段落永远只有正文和 DO 调用行，不会出现 RESULT，
- * 这样它就不会把「assistant 说 DO 然后自己写 RESULT」当成正确的模仿对象。
+ * 注意两件事：
+ * - 模型输出工具调用走原生 DSML（见 special.mjs），但**历史里绝不回写 DSML**：
+ *   已发生的调用统一渲染成 ## Tool_calls 段的 JSON 行，模型没有可模仿的语法样板；
+ * - 工具结果**单独成段**（## Tool_call_result），不塞进 ## Assistant，
+ *   模型就不会把「assistant 说调用、然后自己写结果」当成正确的模仿对象。
  */
 export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
   if (!Array.isArray(messages) || messages.length === 0) {
@@ -43,7 +49,7 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
   }
 
   const systemTexts = [];
-  /** @type {{role: 'user'|'assistant'|'toolResult', lines: string[]}[]} */
+  /** @type {{role: 'user'|'assistant'|'toolCalls'|'toolResult', lines: string[]}[]} */
   const sections = [];
 
   for (const [index, message] of messages.entries()) {
@@ -67,16 +73,19 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
     }
 
     if (role === 'assistant') {
-      const lines = [];
       const text = contentToText(message.content, 'assistant');
-      if (text.trim()) lines.push(text);
+      if (text.trim()) sections.push({ role: 'assistant', lines: [text] });
+
+      const callLines = [];
       for (const call of message.tool_calls ?? []) {
         const fn = call?.function ?? {};
         if (!fn.name) continue;
-        lines.push(renderToolCall(fn.name, fn.arguments));
+        callLines.push(renderToolCall(fn.name, fn.arguments));
       }
-      if (!lines.length) lines.push('');
-      sections.push({ role: 'assistant', lines });
+      // 历史调用单独成段：只写 JSON，不写 DSML / DO，避免模型照抄语法
+      if (callLines.length) sections.push({ role: 'toolCalls', lines: callLines });
+
+      if (!text.trim() && !callLines.length) sections.push({ role: 'assistant', lines: [''] });
       continue;
     }
 
@@ -132,23 +141,28 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
   };
 }
 
+/** 从历史里最近的 ## Tool_calls 段倒着找工具名（tool 结果没带 name 时兜底） */
 function findLastToolName(sections) {
   for (let i = sections.length - 1; i >= 0; i -= 1) {
+    if (sections[i].role !== 'toolCalls') continue;
     for (let j = sections[i].lines.length - 1; j >= 0; j -= 1) {
       const line = sections[i].lines[j];
-      if (line.startsWith('DO:')) {
-        try {
-          return JSON.parse(line.slice(3)).name;
-        } catch {
-          return null;
-        }
+      if (!line.startsWith('{')) continue;
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed && typeof parsed.name === 'string') return parsed.name;
+      } catch {
+        return null;
       }
     }
   }
   return null;
 }
 
-/** 把一次工具调用渲染成 DO 行，历史里给模型看的唯一调用格式 */
+/**
+ * 把一次工具调用渲染成历史里给模型看的一行 JSON（绝不写 DSML / DO）。
+ * 形如：{"name":"exec_shell","args":{"command":"uname -a"}}
+ */
 function renderToolCall(name, args) {
   let parsed = {};
   if (typeof args === 'string') {
@@ -162,5 +176,5 @@ function renderToolCall(name, args) {
     parsed = args;
   }
 
-  return `DO:${JSON.stringify({ name, args: parsed })}`;
+  return JSON.stringify({ name, args: parsed });
 }

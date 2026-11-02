@@ -496,9 +496,3 @@ browser 引擎单轮 2.2–2.9s（浏览器导航 + DOM 轮询）；直连引擎
 This project is licensed under the GNU General Public License v3.0.
 See the [LICENSE](./LICENSE) file for details.
 
-**🥚彩蛋：**
-Q:不能对接deepseek harness？你这项目也不行啊
-**A:你有没有想过一个问题，你为什么要使用dsh，不就是因为dsh严格控制前缀 缓存命中率高所以更省钱吗？关键是，你已经通过这个项目获得了免费token
-那你还非得用dsh干什么😂
-(当然如果你是真心喜欢dsh那就当我没说(ー_ー)!!)
-**

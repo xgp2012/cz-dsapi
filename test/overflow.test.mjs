@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { buildPrompt } from '../src/prompt/build.mjs';
 import { planOverflow } from '../src/prompt/overflow.mjs';
+import { SPECIAL_TOKENS_HEADER } from '../src/prompt/special.mjs';
 
 const long = (tag, n) => `${tag}：${'x'.repeat(n)}`;
 
@@ -24,7 +25,7 @@ test('未超限：原样返回，不产生附件', () => {
   assert.equal(plan.attachment, null);
 });
 
-test('超限：较早段落进附件，正文保留最新段落并在预算内', () => {
+test('超限：较早对话进附件，正文保留最新段落并在预算内', () => {
   const prompt = multiTurnPrompt();
   assert.ok(prompt.length > 10_000);
 
@@ -34,22 +35,60 @@ test('超限：较早段落进附件，正文保留最新段落并在预算内',
   assert.ok(plan.prompt.length <= 10_000, `正文应该压到上限内: ${plan.prompt.length}`);
   assert.match(plan.prompt, /## CONTEXT_ATTACHMENT:/);
   assert.match(plan.prompt, /最后一个问题：用一句话总结/);
+  // 自带协议提示词永远留在正文
+  assert.ok(plan.prompt.includes(SPECIAL_TOKENS_HEADER.trim()));
   assert.ok(!plan.prompt.includes('问题0：'), '最早的问题应该离开正文');
   assert.match(text, /问题0：/);
-  assert.match(text, /## USER_ROLE_MESSAGES:/);
+  assert.match(text, /## User:/);
+  assert.match(text, /## Assistant:/);
   assert.match(plan.attachment.name, /^context-[0-9a-f]{8}\.txt$/);
   assert.equal(plan.attachment.mime, 'text/plain');
   assert.ok(plan.attachment.sections > 0);
   assert.equal(plan.attachment.chars, text.length);
 });
 
-test('超限：system 段和工具声明始终留在正文', () => {
-  const prompt = multiTurnPrompt(8, 3000);
-  const plan = planOverflow(prompt, { maxChars: 12_000 });
-  assert.match(plan.prompt, /## SYSTEM_ROLE_MESSAGES/);
-  assert.match(plan.prompt, /## TOOL_FUNCTIONS:/);
-  assert.match(plan.prompt, /"name":"exec_shell"/);
-  assert.ok(plan.prompt.indexOf('## TOOL_FUNCTIONS:') < plan.prompt.indexOf('## CONTEXT_ATTACHMENT:'));
+test('超限：客户端 system 过大时移进附件，协议提示词和最新对话留在正文', () => {
+  const { prompt } = buildPrompt({
+    messages: [
+      { role: 'system', content: 'SYSSTART-' + 's'.repeat(30_000) + '-SYSEND' },
+      { role: 'user', content: '你好' },
+    ],
+    tools: [{ type: 'function', function: { name: 'exec_shell' } }],
+  });
+
+  const plan = planOverflow(prompt, { maxChars: 6000 });
+  const text = plan.attachment.buffer.toString('utf8');
+
+  assert.ok(plan.prompt.length <= 6000, `正文超限: ${plan.prompt.length}`);
+  assert.ok(plan.prompt.includes(SPECIAL_TOKENS_HEADER.trim()), '协议提示词必须留在正文');
+  assert.match(plan.prompt, /## CONTEXT_ATTACHMENT:/);
+  assert.match(plan.prompt, /## User:\n你好/);
+  assert.ok(!plan.prompt.includes('SYSSTART'), '客户端 system 应该进附件');
+  assert.match(text, /SYSSTART/);
+});
+
+test('超限：工具声明过大时也能移进附件', () => {
+  const bigSchema = {
+    type: 'function',
+    function: {
+      name: 'exec_shell',
+      description: 'BIGTOOLS-' + 'd'.repeat(30_000) + '-BIGTOOLS',
+      parameters: { type: 'object', properties: { command: { type: 'string' } } },
+    },
+  };
+  const { prompt } = buildPrompt({
+    messages: [{ role: 'user', content: '你好' }],
+    tools: [bigSchema],
+  });
+
+  const plan = planOverflow(prompt, { maxChars: 6000 });
+  const text = plan.attachment.buffer.toString('utf8');
+
+  assert.ok(plan.prompt.length <= 6000, `正文超限: ${plan.prompt.length}`);
+  assert.ok(plan.prompt.includes(SPECIAL_TOKENS_HEADER.trim()));
+  assert.match(plan.prompt, /## CONTEXT_ATTACHMENT:/);
+  assert.ok(!plan.prompt.includes('BIGTOOLS'), '工具声明应该进附件');
+  assert.match(text, /BIGTOOLS/);
 });
 
 test('最后一段自己就超长：保留尾部，前面进附件', () => {
@@ -74,8 +113,6 @@ test('最后一段自己就超长：保留尾部，前面进附件', () => {
   assert.match(plan.prompt, /BIGEND/);
   assert.match(text, /BIGSTART/);
   assert.match(plan.prompt, /本段较长/);
-  // 工具结果段的收尾提示不能被拆丢
-  assert.match(plan.prompt, /以上结果由系统注入/);
 });
 
 test('附件超过上限时报错', () => {
@@ -83,12 +120,9 @@ test('附件超过上限时报错', () => {
   assert.throws(() => planOverflow(prompt, { maxChars: 8000, maxAttachmentChars: 5000 }), /MAX_ATTACHMENT_CHARS|超过上限/);
 });
 
-test('system 本身过长、没有可拆段落时报错', () => {
+test('连协议提示词都放不下时报错', () => {
   const { prompt } = buildPrompt({
-    messages: [
-      { role: 'system', content: 's'.repeat(20_000) },
-      { role: 'user', content: '你好' },
-    ],
+    messages: [{ role: 'user', content: 'x'.repeat(20_000) }],
   });
-  assert.throws(() => planOverflow(prompt, { maxChars: 6000 }), /system \/ 工具声明|没有空间/);
+  assert.throws(() => planOverflow(prompt, { maxChars: 1500 }), /无法保留任何对话内容|超过上限/);
 });

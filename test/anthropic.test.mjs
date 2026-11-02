@@ -155,7 +155,9 @@ test('Anthropic：messages 里的 system 角色也接受（客户端常见写法
 });
 
 test('Anthropic tools：tool_use 块 + input 是对象，stop_reason=tool_use', async () => {
-  const web = fakeWeb({ toolText: '先看内核：\nDO:{"name":"exec_shell","args":{"command":"uname -a"}}' });
+  const web = fakeWeb({
+    toolText: '先看内核：\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="exec_shell">\n<｜DSML｜ parameter name="command" string="true">uname -a</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>',
+  });
   await withServer({ web }, async (base) => {
     const res = await post(
       base,
@@ -183,13 +185,13 @@ test('Anthropic tools：tool_use 块 + input 是对象，stop_reason=tool_use', 
     assert.match(web.lastPrompt, /exec_shell/);
     assert.match(web.lastPrompt, /"command"/);
 
-    // 正文块里不能出现 DO 协议行
+    // 正文块里不能出现 DSML 调用语法
     const text = json.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
-    assert.ok(!/DO:/.test(text), `正文漏了 DO: ${text}`);
+    assert.ok(!text.includes('DSML'), `正文漏了 DSML: ${text}`);
   });
 });
 
-test('Anthropic：tool_use / tool_result 历史转换成 DO + TOOL_RESULT 段', async () => {
+test('Anthropic：tool_use / tool_result 历史转换成 Tool_calls + Tool_call_result 段', async () => {
   const web = fakeWeb({ answer: '内核是 6.1。' });
   await withServer({ web }, async (base) => {
     const res = await post(
@@ -223,13 +225,15 @@ test('Anthropic：tool_use / tool_result 历史转换成 DO + TOOL_RESULT 段', 
     const json = await res.json();
     assert.equal(json.stop_reason, 'end_turn');
 
-    // 历史里的 tool_use 会渲染成 DO 块（对外唯一协议，不再用 DSML）
-    assert.match(web.lastPrompt, /DO:\{"name":"exec_shell","args":\{"command":"uname -r"\}\}/);
-    assert.ok(!web.lastPrompt.includes('<|DSML|'), '历史里不该再出现 DSML');
-    assert.match(web.lastPrompt, /## TOOL_RESULT_MESSAGES/);
+    // 历史里的 tool_use 渲染成 ## Tool_calls 段里的 JSON 行（绝不写 DSML / DO）
+    assert.match(web.lastPrompt, /## Tool_calls:\n\{"name":"exec_shell","args":\{"command":"uname -r"\}\}/);
+    const history = web.lastPrompt.slice(web.lastPrompt.indexOf('## User:'));
+    assert.ok(!history.includes('DSML'), '历史里不该出现 DSML');
+    assert.ok(!history.includes('DO:{'), '历史里不该出现 DO');
+    assert.match(web.lastPrompt, /## Tool_call_result:/);
     assert.match(web.lastPrompt, /6\.1\.0/);
     // 工具结果不能混进 assistant 段
-    const assistantSection = web.lastPrompt.split('## ASSISTANT_ROLE_MESSAGES:')[1]?.split('## TOOL_RESULT_MESSAGES')[0] ?? '';
+    const assistantSection = web.lastPrompt.split('## Assistant:')[1]?.split('## Tool_calls:')[0] ?? '';
     assert.ok(!/6\.1\.0/.test(assistantSection), '工具结果被写进了 assistant 段');
   });
 });
@@ -300,7 +304,9 @@ test('Anthropic 流式：事件序列完整，文本增量正确', async () => {
 });
 
 test('Anthropic 流式 tools：tool_use 块 + input_json_delta', async () => {
-  const web = fakeWeb({ toolText: 'DO:{"name":"exec_shell","args":{"command":"ls"}}' });
+  const web = fakeWeb({
+    toolText: '<｜DSML｜ calls>\n<｜DSML｜ invoke name="exec_shell"><｜DSML｜ parameter name="command" string="true">ls</｜DSML｜ parameter></｜DSML｜ invoke>\n</｜DSML｜ calls>',
+  });
   await withServer({ web }, async (base) => {
     const res = await post(
       base,
@@ -324,7 +330,7 @@ test('Anthropic 流式 tools：tool_use 块 + input_json_delta', async () => {
   });
 });
 
-test('Anthropic 流式：协议行（DO/RESULT）不会漏进 text_delta', async () => {
+test('Anthropic 流式：协议行（RESULT / 段标题）不会漏进 text_delta', async () => {
   const web = fakeWeb({
     toolText: '先确认：\n**RESULT：**{"name":"exec_shell","result":"Linux Fake"}\n结论：Linux。',
   });
