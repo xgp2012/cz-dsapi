@@ -2,10 +2,10 @@ import { PromptTooLongError } from './errors.mjs';
 import { loadImage } from './openai/images.mjs';
 import {
   findFabricatedBlock,
+  findToolMarkup,
   hasFabricatedProtocol,
   reconcileStreamedText,
   stripToolMarkup,
-  suppressRepeatedToolCalls,
   ToolMarkupStreamFilter,
 } from './openai/tool-text.mjs';
 import { buildPrompt } from './prompt/build.mjs';
@@ -78,10 +78,49 @@ export function createChatRunner({ config, log, web }) {
      * 其他历史格式（<tool_call> / 原生 token / 旧版 DO）只做静默兜底，不再记日志。
      */
     const evaluate = (text) => {
-      const toolCalls = suppressRepeatedToolCalls(parseToolCalls(text, knownTools), request.messages);
+      const parsed = parseToolCalls(text, knownTools);
+      // 不再做「重复调用抑制」：agent 里同一个调用原样重发是正常操作（每一步之后重新 observe_screen），
+      // 按签名去重会把整轮输出吞成空回答。
+      const toolCalls = parsed;
+      const content = stripToolMarkup(text);
+
+      // 诊断（只记日志，不改行为）：这一轮既没有正文、也没有工具调用时，客户端收到的是一条
+      // 空 assistant 消息，agent 那边会直接判「模型未返回正文或工具调用」把整轮 loop 判失败。
+      // 两种成因（协议块解析不出 / 工具名不在声明里）以前全是静默的，
+      // 线上只能看到「莫名其妙断了」，所以这里必须把原文与丢弃原因留下来。
+      if (!content.trim() && !toolCalls.length) {
+        log?.warn('这一轮没有解析出正文或工具调用，客户端将收到空回答', {
+          chars: text.length,
+          parsedCalls: parsed.length,
+          knownTools: knownTools?.length ?? 0,
+          sample: text.slice(0, 400),
+        });
+        if (parsed.length) {
+          log?.warn('解析出了工具调用但没交给客户端（不该发生，检查 evaluate 的过滤逻辑）', {
+            names: parsed.map((call) => call.name),
+          });
+        } else if (findToolMarkup(text).length) {
+          log?.warn('模型输出了协议块，但没解析出任何工具调用（工具名不在声明里，或 DSML 结构对不上）', {
+            protocolBlocks: findToolMarkup(text).map((block) => block.kind),
+          });
+        }
+      }
+
+      // 未知工具名是「模型自己在乱叫」的信号：照实返回（客户端会回一条 unknown tool 让它纠正），
+      // 但不能静默——以前这里连日志都没有，出事只能靠猜。
+      if (toolCalls.length && knownTools) {
+        const unknown = toolCalls.filter((call) => !knownTools.includes(call.name));
+        if (unknown.length) {
+          log?.warn('模型调用了未声明的工具，已照实返回给客户端', {
+            names: unknown.map((call) => call.name),
+            declared: knownTools.length,
+          });
+        }
+      }
+
       return {
         toolCalls,
-        content: stripToolMarkup(text),
+        content,
         // RESULT / 伪造的 ## 段落标题都算「编造协议」
         fabricated: hasFabricatedProtocol(text),
       };
@@ -90,7 +129,7 @@ export function createChatRunner({ config, log, web }) {
     /** 可见正文为空时，工具调用可能只写在思考里（DeepSeek 的常见行为）：提升成正式调用 */
     const promoteFromReasoning = (reasoning, reply) => {
       if (reply.content.trim() || reply.toolCalls.length || !reasoning) return reply;
-      const toolCalls = suppressRepeatedToolCalls(parseToolCalls(reasoning, knownTools), request.messages);
+      const toolCalls = parseToolCalls(reasoning, knownTools);
       return toolCalls.length ? { ...reply, toolCalls } : reply;
     };
 

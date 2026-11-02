@@ -36,12 +36,22 @@ test('parse: 忽略未完成的 JSON', () => {
   assert.deepEqual(parseToolCalls('DO:{"name":"exec_shell","args":"ls"'), []);
 });
 
-test('parse: 按已知工具名过滤', () => {
+test('parse: 未声明的工具名不再被丢弃（丢弃会让整轮输出变空）', () => {
   const text = 'DO:{"name":"rm_rf","args":"/"} and DO:{"name":"exec_shell","args":"ls"}';
-  const all = parseToolCalls(text);
-  assert.equal(all.length, 2);
-  const filtered = parseToolCalls(text, ['exec_shell']);
-  assert.deepEqual(filtered.map((c) => c.name), ['exec_shell']);
+  assert.deepEqual(parseToolCalls(text).map((c) => c.name), ['rm_rf', 'exec_shell']);
+  // 即使传了 knownTools 也不过滤：未知名字照实返回，交给客户端报 unknown tool
+  assert.deepEqual(parseToolCalls(text, ['exec_shell']).map((c) => c.name), ['rm_rf', 'exec_shell']);
+});
+
+test('parse: 线上抓到的 observe_screen 调用（名字没在声明里）必须解析出来', () => {
+  // 真实抓包：模型调了 observe_screen，但这一轮 tools 里没有这个名字。
+  // 旧实现按名字丢弃 → content 和 tool_calls 双双为空 → 客户端「模型未返回正文或工具调用」。
+  const text =
+    '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="observe_screen">\n<｜DSML｜ parameter name="include_ui_tree" string="false">true</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>';
+  const calls = parseToolCalls(text, ['launch_app', 'tap']);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, 'observe_screen');
+  assert.deepEqual(JSON.parse(calls[0].arguments), { include_ui_tree: true });
 });
 
 test('parse: 去重 + 代码块里也能解析', () => {
@@ -173,8 +183,8 @@ test('parse: DSML 多个 invoke 且能按工具名过滤', () => {
 </｜DSML｜calls>`;
   const all = parseToolCalls(text);
   assert.deepEqual(all.map((c) => c.name), ['exec_shell', 'read_file']);
-  const filtered = parseToolCalls(text, ['read_file']);
-  assert.deepEqual(filtered.map((c) => c.name), ['read_file']);
+  // 传 knownTools 也不再过滤（回归：未声明的名字曾让整轮输出变空）
+  assert.deepEqual(parseToolCalls(text, ['read_file']).map((c) => c.name), ['exec_shell', 'read_file']);
 });
 
 test('parse: DSML 里的参数原样保留（含换行 / 引号）', () => {

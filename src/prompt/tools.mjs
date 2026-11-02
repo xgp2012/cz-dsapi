@@ -256,19 +256,22 @@ function parseNativeToolCalls(text, add) {
  * 最终按出现位置排序，用 canonicalArguments 去重
  * （同一次调用被模型用两种格式重复写出来时只保留一次）。
  *
+ * 工具名不再按声明列表过滤：模型偶尔会调一个没声明过的名字（客户端 system / 历史里出现过），
+ * 按名字丢弃等于把整轮输出一起吞掉 —— 客户端只会收到一条空的 assistant 消息并判定
+ * 「模型未返回正文或工具调用」。未知名字照实返回，由客户端自己回一条 unknown tool，
+ * agent 才能自我纠正、loop 才能继续（这也和 OpenAI 兼容接口的既有行为一致）。
+ *
  * @param {string} text
- * @param {string[]} [knownTools] 已知工具名，用于过滤误伤
+ * @param {string[]} [knownTools] 保留参数：仅用于调用方日志（哪些名字是没声明的），不再参与过滤
  * @returns {{ name: string, arguments: string, raw: string, index: number }[]}
  */
 export function parseToolCalls(text, knownTools = null) {
   if (!text || typeof text !== 'string') return [];
-  const allowed = knownTools ? new Set(knownTools) : null;
   const calls = [];
   const seen = new Set();
 
   const add = (name, args, raw, index) => {
     if (!name) return;
-    if (allowed && !allowed.has(name)) return;
     const argsJson = normalizeArguments(args);
     const signature = `${name}\u0000${canonicalArguments(argsJson)}`;
     if (seen.has(signature)) return;
@@ -277,7 +280,7 @@ export function parseToolCalls(text, knownTools = null) {
   };
 
   // 1) DSML：唯一对外语法（全角 / 半角竖线、截断都能解析）
-  for (const call of parseDsmlCalls(text, allowed)) {
+  for (const call of parseDsmlCalls(text)) {
     add(call.name, call.arguments, call.raw, call.index);
   }
 
@@ -362,7 +365,7 @@ export function renderToolResult(name, content) {
   return `${JSON.stringify({ name: name || 'unknown', result })}`;
 }
 
-/** 统计工具名，用于过滤模型臆造的函数名 */
+/** 统计工具名（给调用方做「模型调了没声明的工具」这类日志/诊断用） */
 export function collectToolNames(tools = []) {
   return tools
     .map((t) => (t?.function ?? t)?.name)

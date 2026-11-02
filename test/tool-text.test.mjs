@@ -2,14 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  collectPriorToolCalls,
   findFabricatedBlock,
   findToolMarkup,
   hasFabricatedProtocol,
   hasFabricatedToolResult,
   reconcileStreamedText,
   stripToolMarkup,
-  suppressRepeatedToolCalls,
   ToolMarkupStreamFilter,
 } from '../src/openai/tool-text.mjs';
 import { parseToolCalls } from '../src/prompt/tools.mjs';
@@ -98,48 +96,6 @@ test('stripToolMarkup: 非法 JSON 只删到行尾', () => {
   const text = '开头\nDO: ls -la\n结尾';
   const cleaned = stripToolMarkup(text);
   assert.equal(cleaned, '开头\n结尾');
-});
-
-test('suppressRepeatedToolCalls: 复述刚执行过的调用会被丢掉', () => {
-  const messages = [
-    { role: 'user', content: '跑一下' },
-    {
-      role: 'assistant',
-      content: '好的',
-      tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'eval_javascript', arguments: '{"code":"1+1"}' } }],
-    },
-    { role: 'tool', tool_call_id: 'call_1', name: 'eval_javascript', content: '{"result":"2"}' },
-  ];
-  const echoed = [{ name: 'eval_javascript', arguments: '{"code":"1+1"}' }];
-  assert.deepEqual(suppressRepeatedToolCalls(echoed, messages), []);
-});
-
-test('suppressRepeatedToolCalls: 新的调用不受影响', () => {
-  const messages = [
-    {
-      role: 'assistant',
-      content: '',
-      tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'eval_javascript', arguments: '{"code":"1+1"}' } }],
-    },
-    { role: 'tool', tool_call_id: 'call_1', name: 'eval_javascript', content: '2' },
-  ];
-  const next = [{ name: 'eval_javascript', arguments: '{"code":"2+2"}' }];
-  assert.equal(suppressRepeatedToolCalls(next, messages).length, 1);
-});
-
-test('suppressRepeatedToolCalls: 最后一条不是 tool 时不动', () => {
-  const messages = [{ role: 'user', content: 'hello' }];
-  const calls = [{ name: 'a', arguments: '{}' }];
-  assert.equal(suppressRepeatedToolCalls(calls, messages).length, 1);
-});
-
-test('collectPriorToolCalls: 收集历史调用', () => {
-  const calls = collectPriorToolCalls([
-    { role: 'assistant', tool_calls: [{ id: 'x', function: { name: 'a', arguments: '{"n":1}' } }] },
-    { role: 'assistant', tool_calls: [{ id: 'y', function: { name: 'b', arguments: { n: 2 } } }] },
-  ]);
-  assert.equal(calls.length, 2);
-  assert.equal(calls[1].arguments, '{"n":2}');
 });
 
 test('流式过滤器：没有协议行时正文按增量输出，收尾不丢字', () => {

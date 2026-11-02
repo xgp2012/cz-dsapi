@@ -86,8 +86,12 @@ function parseParameters(body) {
 
 /**
  * 从文本里解析 DSML 工具调用。
+ *
+ * 注意：不再按「已知工具名」过滤。模型调一个没声明过的名字时，把调用丢掉会让整轮输出变空
+ * （客户端只会看到「模型未返回正文或工具调用」），未知名字应照实返回，交给客户端报 unknown tool。
+ *
  * @param {string} text
- * @param {Set<string>|null} allowed 已知工具名（用于过滤误伤）
+ * @param {Set<string>|null} allowed 保留参数（历史上用于过滤，现已忽略）
  * @returns {{ name: string, arguments: string, raw: string, index: number }[]}
  */
 export function parseDsmlCalls(text, allowed = null) {
@@ -106,7 +110,6 @@ export function parseDsmlCalls(text, allowed = null) {
   const seen = new Set();
   const push = (name, argsJson, raw, position) => {
     if (!name) return;
-    if (allowed && !allowed.has(name)) return;
     const signature = `${name}\u0000${argsJson}`;
     if (seen.has(signature)) return;
     seen.add(signature);

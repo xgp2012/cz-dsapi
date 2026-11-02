@@ -415,43 +415,6 @@ function findSectionStart(text, from = 0) {
   return best;
 }
 
-/** 请求历史里已经出现过的工具调用（用于识别模型「复述」而不是真的再调一次） */
-export function collectPriorToolCalls(messages = []) {
-  const calls = [];
-  for (const message of messages) {
-    if (message?.role !== 'assistant') continue;
-    for (const call of message.tool_calls ?? []) {
-      const fn = call?.function ?? {};
-      if (!fn.name) continue;
-      calls.push({ id: call.id, name: fn.name, arguments: typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments ?? {}) });
-    }
-  }
-  return calls;
-}
-
-/**
- * 如果最后一条是工具结果，说明模型这一轮该给最终回答了。
- * 这时它原样重复刚执行过的调用，视为复述而不是新的工具调用。
- */
-export function suppressRepeatedToolCalls(calls, messages = []) {
-  if (!calls.length) return calls;
-  const last = messages[messages.length - 1];
-  if (!last || last.role !== 'tool') return calls;
-
-  const resultIds = new Set(
-    messages.filter((m) => m?.role === 'tool' && m.tool_call_id).map((m) => m.tool_call_id),
-  );
-  if (!resultIds.size) return calls;
-
-  const prior = collectPriorToolCalls(messages).filter((call) => resultIds.has(call.id));
-  if (!prior.length) return calls;
-
-  const signature = (name, args) => `${name}\u0000${canonicalArguments(args)}`;
-  const priorSet = new Set(prior.map((call) => signature(call.name, call.arguments)));
-
-  return calls.filter((call) => !priorSet.has(signature(call.name, call.arguments)));
-}
-
 /** 段落标题的「可能前缀」：整行还没写完时先扣住，避免半截标题漏进正文 */
 const SECTION_PHRASES = [
   'SYSTEM',

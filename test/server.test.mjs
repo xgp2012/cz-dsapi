@@ -170,7 +170,7 @@ test('工具调用：content 里不出现 DO/RESULT 协议行', async () => {
   });
 });
 
-test('工具调用：模型复述刚执行过的调用会被忽略', async () => {
+test('工具调用：重复的调用照样返回，伪造成果（RESULT）仍从正文里剔除', async () => {
   const echo = '可以，我写个示例：\n\nDO:{"name":"eval_javascript","args":{"code":"1+1"}}\nRESULT:{"result":"2"}\n\n执行成功，结果是 2。';
   await withServer({ web: fakeWeb({ toolText: echo }) }, async (base) => {
     const res = await fetch(`${base}/v1/chat/completions`, {
@@ -194,8 +194,10 @@ test('工具调用：模型复述刚执行过的调用会被忽略', async () =>
     });
     const json = await res.json();
     const message = json.choices[0].message;
-    assert.ok(!message.tool_calls, '复述的调用不该再触发一次');
-    assert.equal(json.choices[0].finish_reason, 'stop');
+    // 不再按「同名同参数」去重：agent 每步重发同一个调用是正常操作，丢掉等于把整轮吞成空回答
+    assert.equal(message.tool_calls?.length, 1, '重复的调用也要照实返回');
+    assert.equal(message.tool_calls[0].function.name, 'eval_javascript');
+    assert.equal(json.choices[0].finish_reason, 'tool_calls');
     assert.ok(!message.content.includes('DO:'));
     assert.ok(!message.content.includes('RESULT:'));
     // 模型在 DO 之后自己编了 RESULT：检测到就早停，RESULT 之后的续写不再返回
@@ -356,6 +358,47 @@ test('流式：DSML 标签不会出现在 content 增量里', async () => {
     const calls = chunks.flatMap((c) => c.choices[0]?.delta?.tool_calls ?? []);
     assert.equal(calls.length, 1);
     assert.equal(calls[0].function.name, 'exec_shell');
+  });
+});
+
+test('多轮工具循环：模型原样重复上一个调用（每步都 observe_screen）必须照实返回', async () => {
+  // 线上抓包：手机 agent 每执行一步都会重新看一眼屏幕，调用与参数跟上一轮完全一样。
+  // 旧实现按「同名同参数」把它当复述丢掉 → content 与 tool_calls 双双为空 → 客户端
+  // 报「模型未返回正文或工具调用」把整轮 loop 判失败。
+  const REPEAT_TEXT =
+    '<｜DSML｜ calls>\n' +
+    '<｜DSML｜ invoke name="observe_screen">\n' +
+    '<｜DSML｜ parameter name="include_screenshot" string="false">true</｜DSML｜ parameter>\n' +
+    '</｜DSML｜ invoke>\n' +
+    '</｜DSML｜ calls>';
+  const messages = [
+    { role: 'user', content: '看一眼屏幕' },
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [
+        {
+          id: 'call_1',
+          type: 'function',
+          function: { name: 'observe_screen', arguments: '{"include_screenshot":true}' },
+        },
+      ],
+    },
+    { role: 'tool', tool_call_id: 'call_1', name: 'observe_screen', content: '{"nodes":3}' },
+  ];
+  const tools = [{ type: 'function', function: { name: 'observe_screen' } }];
+
+  await withServer({ web: fakeWeb({ toolText: REPEAT_TEXT }) }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-flash', stream: true, messages, tools }),
+    });
+    const streamed = readSse(await res.text());
+    assert.equal(streamed.toolCalls.length, 1, '重复的调用不能被丢弃');
+    assert.equal(streamed.toolCalls[0].function.name, 'observe_screen');
+    assert.deepEqual(JSON.parse(streamed.toolCalls[0].function.arguments), { include_screenshot: true });
+    assert.equal(streamed.content.trim(), '', '协议行不能漏进 content');
   });
 });
 
