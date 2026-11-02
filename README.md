@@ -59,7 +59,7 @@ npm run pow:build
 
 直接在控制台敲：
 ```javascript
-copy(JSON.parse(localStorage.getItem("userToken").value))
+copy(JSON.parse(localStorage.getItem("userToken")).value)
 ```
 
 ```bash
