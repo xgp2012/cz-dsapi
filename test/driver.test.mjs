@@ -418,42 +418,6 @@ test('驱动：原始补全流和 DOM 都不完整、页面未确认结束时显
   }
 });
 
-test('驱动：模型编造 RESULT 后无限续写时，主动停止生成并快速返回', async (t) => {
-  const browser = await requireBrowser(t);
-  if (!browser) return;
-
-  const fixture = await startFakeDeepSeek();
-  const web = new DeepSeekWeb({ config: driverConfig(fixture.url), logger });
-  try {
-    // 模拟 chat-runner 的接线：检测到伪造协议就让 onDelta 返回 false（约定 = 停止生成）
-    const filter = new ToolMarkupStreamFilter();
-    const startedAt = Date.now();
-    const result = await web.chat({
-      prompt: 'FABRICATE_LOOP 看看内核版本',
-      onDelta: (text) => {
-        filter.push(text);
-        if (filter.fabricatedStarted) return false;
-        return undefined;
-      },
-    });
-    const elapsed = Date.now() - startedAt;
-
-    assert.ok(elapsed < 5000, `编造 RESULT 后必须快速返回，实际 ${elapsed}ms`);
-    assert.equal(result.timings.endReason, 'fabricated_stop');
-    // 已经拿到的正文 + DO 工具调用仍然保留
-    assert.match(result.text, /DO:\{"name":"exec_shell"/);
-    assert.equal(parseToolCalls(result.text, ['exec_shell']).length, 1);
-    // 伪造 RESULT 及其之后的无限续写不能出现在权威文本里
-    assert.ok(!result.text.includes('RESULT'), `text 不应包含 RESULT: ${result.text}`);
-    assert.ok(!result.text.includes('继续写'), 'text 不应包含 RESULT 之后的续写');
-    // 页面确实被点了停止
-    const stopCount = await web.slots[0].page.evaluate(() => window.__FAKE_STOP_COUNT__ || 0);
-    assert.ok(stopCount >= 1, `应该点过停止生成，实际 ${stopCount}`);
-  } finally {
-    await web.close();
-    await fixture.close();
-  }
-});
 
 /* ------------------------------------------------------------------ *
  * 端到端：真实 browser driver + fake 页面 + 完整 server（SSE 一致性验收）
@@ -579,48 +543,6 @@ test('端到端：DO 之后的自然语言尾巴在流式与非流式里都不�
   }
 });
 
-test('端到端：编造 RESULT 后无限续写时，流式与非流式都快速返回', async (t) => {
-  const browser = await requireBrowser(t);
-  if (!browser) return;
-
-  const fixture = await startFakeDeepSeek();
-  const config = driverConfig(fixture.url);
-  const web = new DeepSeekWeb({ config, logger });
-  try {
-    await withChatServer(web, config, async (base) => {
-      const messages = [{ role: 'user', content: 'FABRICATE_LOOP 看看内核版本' }];
-      const tools = [{ type: 'function', function: { name: 'exec_shell', description: '执行命令' } }];
-
-      // 流式：必须 <5s 返回，且 content 干净、tool_calls 正常
-      const streamStarted = Date.now();
-      const streamRes = await postJson(base, { model: 'deepseek-flash', stream: true, messages, tools });
-      const streamed = readOpenAiStream(await streamRes.text());
-      const streamMs = Date.now() - streamStarted;
-      assert.ok(streamMs < 5000, `流式早停应 <5s，实际 ${streamMs}ms`);
-      assert.equal(streamed.toolCalls.length, 1);
-      assert.equal(streamed.toolCalls[0].function.name, 'exec_shell');
-      assert.equal(streamed.content.trim(), '好的');
-      assert.ok(!streamed.content.includes('RESULT'));
-      assert.ok(!streamed.content.includes('继续写'));
-      assert.equal(streamed.finishReason, 'tool_calls');
-
-      // 非流式：同样快速返回，content 干净、tool_calls 正常
-      const finalStarted = Date.now();
-      const finalRes = await postJson(base, { model: 'deepseek-flash', messages, tools });
-      const finalJson = await finalRes.json();
-      const finalMs = Date.now() - finalStarted;
-      assert.ok(finalMs < 5000, `非流式早停应 <5s，实际 ${finalMs}ms`);
-      const message = finalJson.choices[0].message;
-      assert.equal(message.tool_calls.length, 1);
-      assert.equal(message.content.trim(), '好的');
-      assert.ok(!message.content.includes('RESULT'));
-      assert.ok(!message.content.includes('继续写'));
-    });
-  } finally {
-    await web.close();
-    await fixture.close();
-  }
-});
 
 test.after(async () => {
   await closeBrowser();

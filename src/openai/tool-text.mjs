@@ -191,7 +191,9 @@ export function findToolMarkup(text) {
         // 整行都是协议（或格式不标准）：连着行尾换行一起删，避免留下空行
         end = consumeLineBreak(text, lineEnd);
       }
-      blocks.push({ kind, start: offset, end });
+      // hasJson 是「这行到底像不像协议」的关键：`RESULT:{...}` 是模型编造的工具结果（要中止生成），
+      // 而正文里的散文 `Result: 已打开` 只是碰巧以 RESULT: 开头，绝不能当成编造把整轮掐掉。
+      blocks.push({ kind, start: offset, end, hasJson });
     }
     offset = lineEnd + 1;
     if (lineEnd === text.length) break;
@@ -205,7 +207,7 @@ export function findToolMarkup(text) {
     const brace = inline.index + inline[0].length;
     const json = readJsonObject(text, brace);
     if (!json) continue;
-    blocks.push({ kind: inline[1].toUpperCase(), start: inline.index, end: brace + json.length });
+    blocks.push({ kind: inline[1].toUpperCase(), start: inline.index, end: brace + json.length, hasJson: true });
   }
 
   return merge(blocks);
@@ -224,6 +226,7 @@ function merge(blocks) {
     const last = merged.at(-1);
     if (last && block.start < last.end) {
       last.end = Math.max(last.end, block.end);
+      if (block.hasJson) last.hasJson = true;
       // 重叠区间合并成一个，类型取更「具体」的那个（RESULT > DO > TOOL_CALL）
       if ((KIND_RANK[block.kind] ?? 0) > (KIND_RANK[last.kind] ?? 0)) last.kind = block.kind;
     } else {
@@ -396,11 +399,18 @@ export function findFabricatedBlock(text) {
 }
 
 /**
- * 伪造协议的判定：RESULT / 伪造段标题。
+ * 伪造协议的判定：`RESULT:{...}`（带 JSON 的假工具结果）/ 伪造段标题。
+ *
+ * 注意 RESULT 必须**真的跟着 JSON** 才算：正文里一句散文 `Result: 已打开 Telegram`
+ * 也会被 LINE_LABEL 认成协议行（那一行仍会从 content 里剔除），但它不是编造，
+ * 绝不能据此中止生成 —— 否则一整轮会被掐断，客户端只看到流断在半路。
+ *
  * 自带的结束标记 `<|END|>` 用独立的 END 类型，只是格式标记（不触发重试、不提前终止），不在此列。
  */
 function isFabricatedBlock(block) {
-  return block.kind === 'RESULT' || block.kind === 'SECTION';
+  if (block.kind === 'SECTION') return true;
+  if (block.kind !== 'RESULT') return false;
+  return block.hasJson === true;
 }
 
 /** 流式：提前找到伪造段标题的位置（完整行才算） */
@@ -499,12 +509,6 @@ export class ToolMarkupStreamFilter {
     this.holdBack = holdBack;
     /** 触发截断的块类型：DO / TOOL_CALL / RESULT / SECTION */
     this.cutKind = null;
-    /** 模型是否已经开始输出伪造协议（RESULT / 伪造段标题）——用于提前终止生成，正常工具调用不算 */
-    this.fabricatedStarted = false;
-    /** 伪造协议在全文里的位置（调试/日志用） */
-    this.fabricatedAt = -1;
-    /** 伪造协议增量扫描游标：截断后只需扫新进入的尾巴，避免长续写时反复全文扫描 */
-    this.scanFrom = -1;
   }
 
   push(text) {
@@ -526,35 +530,13 @@ export class ToolMarkupStreamFilter {
     return this.#slice(limit);
   }
 
-  /**
-   * 更新「截断点」和「是否开始伪造协议」。
-   * 第一次截断区分类型：DO / DSML / 原生 token = 正常工具调用；RESULT / 伪造段标题 = fabricated。
-   * 已经因工具调用截断后还要继续盯着后面：模型经常在 DO 之后自己编一个 RESULT 再长篇续写。
-   */
+  /** 更新「截断点」：找到第一个协议块（工具调用 / RESULT / 伪造段标题）就停在那之前。 */
   #refreshCut() {
-    if (this.fabricatedStarted) return;
-
-    if (this.cutIndex < 0) {
-      const cut = this.#findCut();
-      if (!cut) return;
-      this.cutIndex = cut.index;
-      this.cutKind = cut.kind;
-      this.fabricatedStarted = cut.fabricated;
-      if (cut.fabricated) this.fabricatedAt = cut.index;
-      return;
-    }
-
-    // 截断后：只扫描新进入的尾巴（保留一点重叠，防止协议行跨增量被劈开）
-    const start = Math.max(this.cutIndex, this.scanFrom < 0 ? this.cutIndex : this.scanFrom - 512);
-    if (start >= this.buffer.length) return;
-    const slice = this.buffer.slice(start);
-    const block = findToolMarkup(slice).find((one) => one.kind === 'RESULT' || one.kind === 'SECTION');
-    if (block) {
-      this.fabricatedStarted = true;
-      this.fabricatedAt = start + block.start;
-      return;
-    }
-    this.scanFrom = this.buffer.length;
+    if (this.cutIndex >= 0) return;
+    const cut = this.#findCut();
+    if (!cut) return;
+    this.cutIndex = cut.index;
+    this.cutKind = cut.kind;
   }
 
   /** 没有工具调用：把剩下的正文（含被挡住的部分，去掉协议行）补发出去 */
@@ -576,11 +558,7 @@ export class ToolMarkupStreamFilter {
     if (section >= 0) candidates.push({ index: section, kind: 'SECTION' });
     if (!candidates.length) return null;
     const first = candidates.reduce((a, b) => (b.index < a.index ? b : a));
-    return {
-      index: first.index,
-      kind: first.kind,
-      fabricated: first.kind === 'RESULT' || first.kind === 'SECTION',
-    };
+    return { index: first.index, kind: first.kind };
   }
 
   #slice(limit) {

@@ -1,7 +1,6 @@
 import { PromptTooLongError } from './errors.mjs';
 import { loadImage } from './openai/images.mjs';
 import {
-  findFabricatedBlock,
   findToolMarkup,
   hasFabricatedProtocol,
   reconcileStreamedText,
@@ -10,7 +9,6 @@ import {
 } from './openai/tool-text.mjs';
 import { buildPrompt } from './prompt/build.mjs';
 import { planOverflow } from './prompt/overflow.mjs';
-import { STRICT_REPLY_NOTE } from './prompt/special.mjs';
 import { parseToolCalls } from './prompt/tools.mjs';
 
 /**
@@ -149,78 +147,15 @@ export function createChatRunner({ config, log, web }) {
         onThinking: hooks.onThinking,
       });
 
-    const abortOnFabrication = config.runtime.abortOnFabrication !== false;
-
-    /**
-     * 模型开始输出 RESULT / 伪造段标题的瞬间截断权威文本：
-     * 后面多半是它在编造工具结果之后的长篇续写，既不该进 content，也不该继续等它写完。
-     * 截断点由 findToolMarkup 决定，正常 DO / DSML / 原生工具调用不会命中。
-     */
-    const truncateAtFabrication = (text) => {
-      const block = abortOnFabrication ? findFabricatedBlock(text) : null;
-      if (!block) return { text, truncated: false };
-      return { text: text.slice(0, block.start), truncated: true };
-    };
-
     if (!request.stream) {
-      // 非流式也要在底层流式过程中检测伪造协议：命中就立刻让引擎停止生成，避免一直等到模型续写结束
-      const detector = new ToolMarkupStreamFilter();
-      let stoppedForFabrication = false;
-      let result = await run(prompt, fileIds, {
-        onDelta: (text) => {
-          detector.push(text);
-          if (abortOnFabrication && detector.fabricatedStarted) {
-            stoppedForFabrication = true;
-            return false;
-          }
-          return undefined;
-        },
-      });
-      stoppedForFabrication = stoppedForFabrication || Boolean(result.stoppedByFabrication);
-      const truncated = truncateAtFabrication(result.text);
-      if (truncated.truncated) stoppedForFabrication = true;
-      let reply = promoteFromReasoning(result.reasoning, evaluate(truncated.text));
-      result = { ...result, text: truncated.text };
+      // 不检测、不中断、不截断：模型写多少就收多少，出口只做协议清洗（RESULT 行从正文里剔掉）
+      let result = await run(prompt, fileIds);
+      let reply = promoteFromReasoning(result.reasoning, evaluate(result.text));
 
-      if (stoppedForFabrication) {
-        log?.warn?.('检测到模型编造工具结果，已提前终止生成（非流式）', {
+      if (reply.fabricated) {
+        log?.warn?.('模型输出了自造的工具结果（RESULT），已从正文里剔除', {
           toolCalls: reply.toolCalls.length,
-          keptChars: truncated.text.length,
         });
-      } else if (reply.fabricated) {
-        log?.warn?.('模型输出了自造的工具结果（RESULT）', {
-          toolCalls: reply.toolCalls.length,
-          retry: !reply.toolCalls.length && config.runtime.retryOnFabrication,
-        });
-      }
-
-      // 只出现 RESULT、却没有真的解析出调用：说明这一轮在编造工具结果。
-      // 带上更硬的约束重来一次（流式已发出去的内容不回滚，只清洗）。
-      // 已经因为编造协议提前终止生成时不再重试：再生成一次只会更慢，而且大概率还是会编。
-      if (
-        !stoppedForFabrication &&
-        reply.fabricated &&
-        !reply.toolCalls.length &&
-        config.runtime.retryOnFabrication
-      ) {
-        const retryPlan = prepare(STRICT_REPLY_NOTE);
-        try {
-          // 附件按内容 hash 缓存：同样的上下文不会重复上传
-          const retryFileIds = [...imageIds, ...(await uploadAttachment(retryPlan))];
-          const second = await run(retryPlan.prompt, retryFileIds);
-          const secondReply = promoteFromReasoning(second.reasoning, evaluate(second.text));
-          if (replyScore(secondReply) > replyScore(reply)) {
-            result = second;
-            reply = secondReply;
-            log?.info?.('重试后已得到干净回答');
-          } else {
-            log?.warn?.('重试后仍在自造结果，保留清洗后的首次回答');
-          }
-        } catch (err) {
-          // 重试失败不能把已经拿到的（清洗后的）回答一起丢掉
-          if (signal?.aborted) throw err;
-          log?.warn?.('自造结果重试失败，退回首次回答:', err.message);
-        }
       }
 
       return {
@@ -229,7 +164,6 @@ export function createChatRunner({ config, log, web }) {
         attachment: initial.attachment,
         text: result.text,
         reasoning: cleanReasoning(result.reasoning),
-        stoppedForFabrication,
         elapsedMs: result.elapsedMs,
         ...reply,
       };
@@ -237,7 +171,6 @@ export function createChatRunner({ config, log, web }) {
 
     // 流式：协议行挡在 SSE 之外，收尾由这里统一核对/补发
     const filter = new ToolMarkupStreamFilter();
-    let stoppedForFabrication = false;
     let sentContent = '';
     let sentReasoning = '';
     const emitContent = (text) => {
@@ -261,38 +194,21 @@ export function createChatRunner({ config, log, web }) {
       onDelta: (text) => {
         const safe = filter.push(text);
         if (safe) emitContent(safe);
-        if (abortOnFabrication && filter.fabricatedStarted) {
-          // 约定：onDelta 返回 false = 立即停止生成（direct abort fetch / browser 点停止）
-          stoppedForFabrication = true;
-          return false;
-        }
-        return undefined;
       },
       onThinking: (text) => emitReasoning(text),
     });
-    stoppedForFabrication = stoppedForFabrication || Boolean(result.stoppedByFabrication);
-    const truncated = truncateAtFabrication(result.text);
-    if (truncated.truncated) stoppedForFabrication = true;
-    const authoritativeText = truncated.text;
+    const authoritativeText = result.text;
 
     const reply = promoteFromReasoning(result.reasoning, evaluate(authoritativeText));
-    if (stoppedForFabrication) {
-      log?.warn?.('检测到模型编造工具结果，已提前终止生成（流式）', {
-        toolCalls: reply.toolCalls.length,
-        keptChars: authoritativeText.length,
-      });
-    } else if (reply.fabricated) {
+    if (reply.fabricated) {
       log?.warn?.('模型输出了自造的工具结果（RESULT），已从流式 content 中剔除', {
         toolCalls: reply.toolCalls.length,
       });
     }
 
-    // 先把被协议行挡住的剩余正文补发（有 toolCalls 时也要发：DO 块之后的自然语言不能丢）。
-    // 提前终止时不要 flushRest：buffer 里剩下的正是编造 RESULT 之后的长篇续写，必须丢掉。
-    if (!filter.fabricatedStarted) {
-      const rest = filter.flushRest();
-      if (rest) emitContent(rest);
-    }
+    // 把被协议行挡住的剩余正文补发出去（有 toolCalls 时也要发：DO 块之后的自然语言不能丢）
+    const rest = filter.flushRest();
+    if (rest) emitContent(rest);
 
     // 收尾核对：SSE 一旦发出去就不能撤回，只能补发尾巴。
     // 浏览器 DOM 的 markdown 序列化与模型原始文本经常不是前缀关系（空行/列表符/收尾符），
@@ -332,16 +248,8 @@ export function createChatRunner({ config, log, web }) {
       text: authoritativeText,
       reasoning: finalReasoning,
       streamedContent: sentContent,
-      stoppedForFabrication,
       elapsedMs: result.elapsedMs,
       ...reply,
     };
   };
-}
-
-/** 比较两次回答哪次更可用：没有自造结果 > 有真实工具调用 > 有正文 > 空 */
-function replyScore(reply) {
-  if (reply.fabricated) return reply.toolCalls.length ? 1 : 0;
-  if (reply.toolCalls.length) return 3;
-  return reply.content.trim() ? 2 : 0;
 }

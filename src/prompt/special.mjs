@@ -274,14 +274,6 @@ Output specifications:
  */
 export const REPLY_END_TOKEN = '< | | END | | >';
 
-/**
- * 检测到模型自造工具结果后，非流式请求会带着这段补充说明重试一次。
- * 拼在客户端 system 段末尾，作为比常规规则更硬的约束。
- */
-export const STRICT_REPLY_NOTE = `**本次回答的额外约束**：上一条回答里出现了 RESULT / 伪造的上下文段落，这是被禁止的。
-不要输出 RESULT、Tool_call_result、## 段落标题，也不要编造工具输出或没有出现过的对话。
-没有工具结果时，就基于已有信息用自然语言回答，或者按约定输出完整的 DSML 工具调用块。`;
-
 export const SECTION = {
   system: '## System:',
   tools: '## Tool_functions:',

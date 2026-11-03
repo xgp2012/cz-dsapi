@@ -174,11 +174,6 @@ export function loadConfig(env = process.env) {
       maxAttachmentChars: int(env.MAX_ATTACHMENT_CHARS, 2_000_000),
       // 关掉就恢复旧行为：超长直接 413
       overflowToAttachment: bool(env.OVERFLOW_TO_ATTACHMENT, true),
-      // 模型自己编造工具结果（RESULT）时，非流式请求带着更硬的约束重试一次
-      retryOnFabrication: bool(env.RETRY_ON_FABRICATION, true),
-      // 流式检测到模型自己写 RESULT / 伪造段落标题时，立即中止生成（不再等模型续写完），
-      // 把已拿到的正文和工具调用先返回，避免请求卡住
-      abortOnFabrication: bool(env.ABORT_ON_FABRICATION, true),
       // 浏览器模式：抓页面自己发出的 /api/v0/chat/completion 原始流，用模型原始输出
       // （含 DO 工具调用 token）作为权威文本，DOM 只负责流式展示。关掉退回纯 DOM 提取。
       browserCapture: bool(env.BROWSER_CAPTURE, true),

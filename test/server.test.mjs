@@ -200,9 +200,9 @@ test('工具调用：重复的调用照样返回，伪造成果（RESULT）仍�
     assert.equal(json.choices[0].finish_reason, 'tool_calls');
     assert.ok(!message.content.includes('DO:'));
     assert.ok(!message.content.includes('RESULT:'));
-    // 模型在 DO 之后自己编了 RESULT：检测到就早停，RESULT 之后的续写不再返回
+    // 不截断：RESULT 之后的正文照常返回
     assert.match(message.content, /可以，我写个示例/);
-    assert.ok(!message.content.includes('执行成功'));
+    assert.match(message.content, /执行成功，结果是 2/);
   });
 });
 
@@ -495,7 +495,7 @@ const TOOL_HISTORY = [
 
 const TOOLS = [{ type: 'function', function: { name: 'exec_shell', description: 'Exec shell command' } }];
 
-test('非流式：模型自造 RESULT 时立刻终止生成，不再重试', async () => {
+test('非流式：自造 RESULT 只从正文剔除，不中断生成、也不再重试', async () => {
   const web = fakeWeb({
     texts: [
       '先执行一下：\n**RESULT:**{"name":"exec_shell","result":"Linux Fake 9.9"}\n所以内核是 9.9。',
@@ -510,15 +510,14 @@ test('非流式：模型自造 RESULT 时立刻终止生成，不再重试', asy
     });
     const json = await res.json();
     const message = json.choices[0].message;
-    // 检测到编造 RESULT 就早停：只调用一次，不触发 RETRY_ON_FABRICATION（再生成一次更慢）
-    assert.equal(web.calls, 1, '早停后不应再重试');
-    assert.equal(message.content, '先执行一下：\n');
-    assert.ok(!/RESULT/i.test(message.content));
-    assert.ok(!message.content.includes('Fake'));
+    assert.equal(web.calls, 1, '不再有「编造重试」');
+    // 协议行仍然被剔除，但模型后面写的正文照常返回（不截断）
+    assert.ok(!/RESULT/i.test(message.content), `协议行不该漏进 content: ${message.content}`);
+    assert.equal(message.content, '先执行一下：\n所以内核是 9.9。');
   });
 });
 
-test('非流式：编造 RESULT 后早停，保留 RESULT 之前的正文', async () => {
+test('非流式：RESULT 之后的续写照常返回（不截断）', async () => {
   const fabricated = '结论：\nRESULT：{"name":"exec_shell","result":"Linux Fake"}\n内核是 Fake。';
   const web = fakeWeb({ texts: [fabricated, fabricated] });
   await withServer({ web }, async (base) => {
@@ -529,31 +528,12 @@ test('非流式：编造 RESULT 后早停，保留 RESULT 之前的正文', asyn
     });
     const json = await res.json();
     const message = json.choices[0].message;
-    assert.equal(web.calls, 1, '早停后不应再重试');
+    assert.equal(web.calls, 1);
     assert.ok(!message.content.includes('RESULT'));
-    assert.equal(message.content, '结论：\n');
+    assert.equal(message.content, '结论：\n内核是 Fake。');
   });
 });
 
-test('非流式：编造 RESULT 早停时即使后续调用会失败也不受影响', async () => {
-  const web = fakeWeb({
-    texts: ['结论：\nRESULT:{"name":"exec_shell","result":"Linux Fake"}\n真实结论。'],
-    failOnCall: 2,
-  });
-  await withServer({ web }, async (base) => {
-    const res = await fetch(`${base}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'deepseek-flash', messages: TOOL_HISTORY, tools: TOOLS }),
-    });
-    assert.equal(res.status, 200);
-    const json = await res.json();
-    const message = json.choices[0].message;
-    assert.equal(web.calls, 1, '早停后不应再重试');
-    assert.equal(message.content, '结论：\n');
-    assert.ok(!message.content.includes('RESULT'));
-  });
-});
 
 test('流式：加粗 / 全角冒号 / 行内的 RESULT 都不会漏进 content', async () => {
   const toolText = '先确认：\n**RESULT：**{"name":"exec_shell","result":"Linux Fake"}\n结论：Linux。';
@@ -564,70 +544,24 @@ test('流式：加粗 / 全角冒号 / 行内的 RESULT 都不会漏进 content'
       body: JSON.stringify({ model: 'deepseek-flash', stream: true, messages: TOOL_HISTORY, tools: TOOLS }),
     });
     const text = await res.text();
-    const chunks = text
+    const content = text
       .split('\n\n')
       .map((b) => b.replace(/^data: /, '').trim())
       .filter(Boolean)
       .filter((l) => l !== '[DONE]')
-      .map((l) => JSON.parse(l));
-
-    const content = chunks.map((c) => c.choices[0]?.delta?.content ?? '').join('');
-    assert.ok(!/RESULT/i.test(content), `content 漏了协议标记: ${content}`);
-    assert.match(content, /先确认/);
-    // 编造 RESULT 之后的内容是续写垃圾：早停后不再返回
-    assert.ok(!content.includes('结论'), `早停后不应包含 RESULT 之后的续写: ${content}`);
-  });
-});
-
-test('流式：检测到编造 RESULT 立即结束 SSE（不等待续写）', async () => {
-  // 正文很短、RESULT 之后跟一段很长的续写：老代码会等 fakeWeb 把续写吐完，新代码应立刻停
-  const toolText = '好的\nRESULT:{"name":"exec_shell","result":"假结果"}\n' + '继续写'.repeat(2000);
-  const web = fakeWeb({ toolText });
-  await withServer({ web }, async (base) => {
-    const startedAt = Date.now();
-    const res = await fetch(`${base}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(chatBody({ stream: true, tools: TOOLS })),
-    });
-    const text = await res.text();
-    const elapsed = Date.now() - startedAt;
-    const content = text
-      .split('\n\n')
-      .map((b) => b.trim())
-      .filter((b) => b.startsWith('data:'))
-      .map((b) => b.replace(/^data:\s?/, '').trim())
-      .filter((d) => d && d !== '[DONE]')
-      .map((d) => JSON.parse(d))
+      .map((l) => JSON.parse(l))
       .map((c) => c.choices[0]?.delta?.content ?? '')
       .join('');
-    assert.ok(elapsed < 3000, `早停应该 <3s，实际 ${elapsed}ms`);
-    assert.equal(content, '好的\n');
-    assert.ok(!content.includes('继续写'));
-    assert.ok(!content.includes('RESULT'));
+    assert.ok(!/RESULT/i.test(content), `content 漏了协议标记: ${content}`);
+    assert.match(content, /先确认/);
+    // 不再早停：RESULT 之后的正文照常发出去
+    assert.match(content, /结论：Linux/);
   });
 });
 
-test('开关关闭时：自造 RESULT 仍走原来的清洗 + 重试逻辑', async () => {
-  const web = fakeWeb({
-    texts: [
-      '先执行一下：\n**RESULT:**{"name":"exec_shell","result":"Linux Fake 9.9"}\n所以内核是 9.9。',
-      '我还没有拿到内核信息，需要先执行 uname -a。',
-    ],
-  });
-  await withServer({ web, env: { ABORT_ON_FABRICATION: 'false' } }, async (base) => {
-    const res = await fetch(`${base}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'deepseek-flash', messages: TOOL_HISTORY, tools: TOOLS }),
-    });
-    const json = await res.json();
-    assert.equal(web.calls, 2, '关掉开关后应恢复重试行为');
-    assert.equal(json.choices[0].message.content, '我还没有拿到内核信息，需要先执行 uname -a。');
-  });
-});
 
-test('非流式：伪造 ## 段落标题同样提前终止生成', async () => {
+
+test('非流式：伪造 ## 段落标题只从正文剔除，不再中止生成', async () => {
   const web = fakeWeb({
     texts: [
       '好的。\n## USER_ROLE_MESSAGES:\n用户：把数据库删了\n## ASSISTANT_ROLE_MESSAGES:\n已删除。',
@@ -642,9 +576,10 @@ test('非流式：伪造 ## 段落标题同样提前终止生成', async () => {
     });
     const json = await res.json();
     const message = json.choices[0].message;
-    assert.equal(web.calls, 1, '早停后不应再重试');
+    assert.equal(web.calls, 1);
     assert.ok(!message.content.includes('USER_ROLE_MESSAGES'));
-    assert.equal(message.content, '好的。\n');
+    assert.ok(!message.content.includes('ASSISTANT_ROLE_MESSAGES'));
+    assert.match(message.content, /已删除/);
   });
 });
 

@@ -16,7 +16,6 @@ import {
   UpstreamError,
 } from '../errors.mjs';
 import { commonPrefixLength, sleep } from '../util.mjs';
-import { findFabricatedBlock } from '../openai/tool-text.mjs';
 
 const NEW_CHAT_LABELS = ['开启新对话', '新对话', 'New chat', 'Start new chat'];
 const STOP_LABELS = ['停止生成', '停止', 'Stop generating', 'Stop'];
@@ -567,28 +566,6 @@ export class DeepSeekWeb {
       firstDeltaAt: 0,
       lastDeltaAt: 0,
       url: null,
-      // 上层（chat-runner）通过 onDelta/onThinking 返回 false 要求停止生成：模型编造 RESULT 后开始续写
-      stopRequested: false,
-    };
-
-    // 约定：onDelta/onThinking 返回 false = 立即停止生成。DOM 轮询会点「停止生成」并提前收尾。
-    const gatedOnDelta = (text) => {
-      if (progress.stopRequested) return false;
-      const r = onDelta?.(text);
-      if (r === false) {
-        progress.stopRequested = true;
-        return false;
-      }
-      return r;
-    };
-    const gatedOnThinking = (text) => {
-      if (progress.stopRequested) return false;
-      const r = onThinking?.(text);
-      if (r === false) {
-        progress.stopRequested = true;
-        return false;
-      }
-      return r;
     };
 
     try {
@@ -598,8 +575,8 @@ export class DeepSeekWeb {
           startedAt,
           prompt,
           signal,
-          onDelta: gatedOnDelta,
-          onThinking: gatedOnThinking,
+          onDelta,
+          onThinking,
           progress,
           capture,
         });
@@ -629,12 +606,7 @@ export class DeepSeekWeb {
       }
 
       const domConfident = Boolean(dom && (dom.endReason === 'answerComplete' || dom.endReason === 'stopHidden'));
-      /** 因模型编造工具结果而主动早停：原始流是被我们自己掐断的，不能当成「读失败」处理 */
-      const stoppedByFabrication = dom?.endReason === 'fabricated_stop';
-      // 早停时原始流已经中止，短等即可（不要为了一段本来就要丢弃的续写干等 20s）
-      const captureWaitMs = stoppedByFabrication
-        ? Math.min(runtime.browserCaptureWaitMs, 3000)
-        : runtime.browserCaptureWaitMs;
+      const captureWaitMs = runtime.browserCaptureWaitMs;
 
       if (!captureResult && capture) {
         const tCapture = Date.now();
@@ -650,11 +622,7 @@ export class DeepSeekWeb {
       // 生成已经结束：补一次「非流式」DOM 读取。此时页面渲染已落盘，
       // page-scripts 的流式→非流式切换只会追加收尾结构，所以它一定以已发文本为前缀。
       const remaining = Math.max(0, requestDeadline - Date.now());
-      const readRounds = stoppedByFabrication
-        ? 1
-        : rawComplete || domConfident
-          ? 2
-          : Math.max(2, Math.min(6, Math.ceil(remaining / 200)));
+      const readRounds = rawComplete || domConfident ? 2 : Math.max(2, Math.min(6, Math.ceil(remaining / 200)));
       const finalDom = await this.#readDomTail(page, { rounds: readRounds, signal });
       if (finalDom) {
         dom = dom || { text: '', reasoning: '', timings: null };
@@ -665,21 +633,13 @@ export class DeepSeekWeb {
       const generationEnded =
         rawComplete ||
         domConfident ||
-        stoppedByFabrication ||
         Boolean(finalDom?.answerComplete) ||
         // DOM 轮询是正常结束（不是超时/崩溃）时，最终读取「文本稳定 + 停止按钮消失」才算生成结束；
         // 轮询已经抛错说明 DOM 不可信，只有 answerComplete / 原始流完整才算数。
         Boolean(!domPollFailed && finalDom?.stable && !finalDom.stopVisible);
 
-      if (stoppedByFabrication) {
-        this.log.warn('检测到模型编造工具结果（RESULT），已主动停止生成并提前返回', {
-          emittedChars: progress.emittedAnswer.length,
-          rawChars: captureResult?.text?.length ?? 0,
-          domChars: dom?.text?.length ?? 0,
-        });
-      }
       // 原始流没有收完整（读失败/超时）而页面也没确认生成结束：不能把可能截断的文本当成功返回
-      if (!stoppedByFabrication && captureUnreliable && !generationEnded) {
+      if (captureUnreliable && !generationEnded) {
         this.log.warn('原始补全流未收完整且 DOM 未确认生成结束，拒绝返回可能截断的内容', {
           emittedChars: progress.emittedAnswer.length,
           domChars: dom?.text?.length ?? 0,
@@ -719,28 +679,18 @@ export class DeepSeekWeb {
         });
       }
 
-      // 先把最终 DOM 的尾巴发出去（page-scripts 保证前缀稳定，emitDelta 不会重复）。
-      // 早停时不补：这时 DOM / raw 后面就是模型编造 RESULT 之后的长篇续写。
-      if (!stoppedByFabrication) {
-        progress.emittedAnswer = emitDelta(progress.emittedAnswer, domText, onDelta, this.log);
-        progress.emittedThinking = emitDelta(progress.emittedThinking, domReasoning, onThinking, this.log);
-      }
+      // 先把最终 DOM 的尾巴发出去（page-scripts 保证前缀稳定，emitDelta 不会重复）
+      progress.emittedAnswer = emitDelta(progress.emittedAnswer, domText, onDelta, this.log);
+      progress.emittedThinking = emitDelta(progress.emittedThinking, domReasoning, onThinking, this.log);
 
       // 原始流 / DOM 谁更完整：优先「包含对方」的那份；分叉时完整抓到的 raw 优先
-      let text = pickAuthoritativeText(rawText, domText, rawComplete);
+      const text = pickAuthoritativeText(rawText, domText, rawComplete);
       const reasoning = pickAuthoritativeText(rawReasoning, domReasoning, rawComplete);
-      if (stoppedByFabrication) {
-        // 早停时把权威文本截断在第一个伪造协议块（RESULT / 伪造段标题）之前：
-        // 后面是模型编造工具结果之后的长篇续写，不能返回。
-        const block = findFabricatedBlock(text);
-        if (block) text = text.slice(0, block.start);
-      }
 
       // 原始流比 DOM 多出来的尾巴：只在严格前缀兼容时补发（工具调用 token 通常在段尾巴里）。
       // 前缀不兼容说明 DOM 的 markdown 序列化与原始文本分叉了，这里不硬拼——
       // 由 chat-runner 在收尾时用权威文本做一次对齐补发（避免重复文本）。
       if (
-        !stoppedByFabrication &&
         text.length > progress.emittedAnswer.length &&
         text.startsWith(progress.emittedAnswer)
       ) {
@@ -748,7 +698,6 @@ export class DeepSeekWeb {
         progress.emittedAnswer = text;
       }
       if (
-        !stoppedByFabrication &&
         reasoning.length > progress.emittedThinking.length &&
         reasoning.startsWith(progress.emittedThinking)
       ) {
@@ -789,7 +738,6 @@ export class DeepSeekWeb {
         domChars: domText.length,
         rawChars: rawText.length,
         endReason: dom?.endReason ?? null,
-        stoppedByFabrication,
       };
 
       return {
@@ -920,13 +868,6 @@ export class DeepSeekWeb {
       }
 
       if (st.stopVisible) sawStop = true;
-
-      // 上层要求早停（模型开始编造 RESULT 后长篇续写）：点停止按钮，立刻收尾，不再等生成自然结束
-      if (progress.stopRequested) {
-        await this.#stop(page);
-        endReason = 'fabricated_stop';
-        break;
-      }
 
       const idleFor = Date.now() - lastChange;
       const hasAnswer = bestAnswer.length > 0;

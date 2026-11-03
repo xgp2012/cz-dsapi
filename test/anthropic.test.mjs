@@ -343,12 +343,12 @@ test('Anthropic 流式：协议行（RESULT / 段标题）不会漏进 text_delt
       .join('');
     assert.ok(!/RESULT/i.test(text), `text_delta 漏了协议标记: ${text}`);
     assert.match(text, /先确认/);
-    // 编造 RESULT 之后的续写被早停丢弃
-    assert.ok(!text.includes('结论'), `早停后不应包含续写: ${text}`);
+    // 不再早停：RESULT 之后的正文照常发出去
+    assert.match(text, /结论：Linux/);
   });
 });
 
-test('Anthropic 非流式：自造 RESULT 会提前终止生成，不再重试', async () => {
+test('Anthropic 非流式：自造 RESULT 只从正文剔除，不中断、不重试', async () => {
   const web = fakeWeb({
     texts: [
       '先执行一下：\n**RESULT:**{"name":"exec_shell","result":"Linux Fake 9.9"}\n所以内核是 9.9。',
@@ -365,10 +365,10 @@ test('Anthropic 非流式：自造 RESULT 会提前终止生成，不再重试',
     );
     assert.equal(res.status, 200);
     const json = await res.json();
-    assert.equal(web.calls, 1, '早停后不应再重试');
+    assert.equal(web.calls, 1, '不再有「编造重试」');
     const text = json.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
     assert.ok(!/RESULT/i.test(text));
-    assert.equal(text, '先执行一下：\n');
+    assert.equal(text, '先执行一下：\n所以内核是 9.9。');
   });
 });
 
