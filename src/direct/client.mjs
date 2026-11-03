@@ -275,6 +275,12 @@ export class DirectEngine {
     /** 空流重试次数：限流时接口经常只回一个空的 event: ready，先短等重试几次再判定为限流 */
     let emptyRetries = 0;
     for (;;) {
+      /**
+       * 调用方（chat-runner）通过 onDelta/onThinking 返回 false 要求提前停止生成。
+       * 必须声明在 try 外面：我们自己 abort 之后 for-await 关闭流会抛 AbortError，
+       * catch 需要靠这个标记把「主动早停」和「真失败」区分开。
+       */
+      let stopRequested = false;
       const controller = new AbortController();
       const onAbort = () => controller.abort(signal?.reason);
       signal?.addEventListener('abort', onAbort, { once: true });
@@ -348,8 +354,6 @@ export class DirectEngine {
         let emittedContent = '';
         let emittedReasoning = '';
         let firstTokenAt = 0;
-        /** 调用方（chat-runner）通过 onDelta/onThinking 返回 false 要求提前停止生成 */
-        let stopRequested = false;
 
         const emit = () => {
           if (stopRequested) return;
@@ -406,24 +410,31 @@ export class DirectEngine {
             }
           }
         } catch (err) {
-          if (signal?.aborted) {
-            throw new UpstreamError('客户端已断开，已停止生成', { status: 499, code: 'client_closed' });
+          // 主动早停（模型开始编造 RESULT / 段标题）是我们自己 abort 的：for-await 关闭流时
+          // 会抛 AbortError（DOMException: This operation was aborted）。这不是失败，
+          // 继续往下按「正常收尾」返回已积累的内容 —— 否则客户端收到的是错误帧，
+          // 这一轮已经解析出来的 tool_calls 也会一起丢掉。
+          const selfAborted = stopRequested && !signal?.aborted;
+          if (!selfAborted) {
+            if (signal?.aborted) {
+              throw new UpstreamError('客户端已断开，已停止生成', { status: 499, code: 'client_closed' });
+            }
+            if (timedOut || err instanceof TimeoutError) {
+              throw new TimeoutError(`等待 DeepSeek 响应超时（${Math.round(timeoutMs / 1000)}s）`);
+            }
+            // 已经流出一部分正文/思考：换号重放会让客户端看到重复内容，外层据此不再重试
+            if (err && typeof err === 'object' && (emittedContent || emittedReasoning)) {
+              err.partialOutput = true;
+            }
+            throw err;
           }
-          if (timedOut || err instanceof TimeoutError) {
-            throw new TimeoutError(`等待 DeepSeek 响应超时（${Math.round(timeoutMs / 1000)}s）`);
-          }
-          // 已经流出一部分正文/思考：换号重放会让客户端看到重复内容，外层据此不再重试
-          if (err && typeof err === 'object' && (emittedContent || emittedReasoning)) {
-            err.partialOutput = true;
-          }
-          throw err;
         }
         if (!stopRequested) {
           parser.flush();
           emit();
         }
 
-        if (!emittedContent && !emittedReasoning) {
+        if (!stopRequested && !emittedContent && !emittedReasoning) {
           // 被限流时接口常常只回一个空的 event: ready。先短等重试几次：
           // 不少空流只是瞬时抖动，直接抛 429 会让 agent 的工具调用轮次「丢流」失败。
           if (emptyRetries < 2) {
