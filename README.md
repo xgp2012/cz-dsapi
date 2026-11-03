@@ -4,8 +4,6 @@
 
 把 **chat.deepseek.com 网页版** 包装成 **OpenAI / Anthropic 双协议兼容 API**。
 
-**与其他项目不同，因为没有明显的工具调用特征，实测按照提示使用此项目个人使用无封号/禁言问题**
-
 上下文不打在服务端：每条请求都把历史按 `## System` / `## User` / `## Assistant` / `## Tool_calls` / `## Tool_call_result` 的段落格式拼成一条 prompt，作为一次**全新对话**发给模型。客户端 system 在最上面，自带的协议提示词夹在中间，工具声明和 user/对话历史在后面。
 
 两种引擎，默认 **direct**（Playwright 驱动真实网页）：
