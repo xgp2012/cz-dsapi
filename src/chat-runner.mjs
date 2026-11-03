@@ -9,7 +9,7 @@ import {
 } from './openai/tool-text.mjs';
 import { buildPrompt } from './prompt/build.mjs';
 import { planOverflow } from './prompt/overflow.mjs';
-import { parseToolCalls } from './prompt/tools.mjs';
+import { coerceToolCallArguments, getToolSchemas, parseToolCalls } from './prompt/tools.mjs';
 
 /**
  * 引擎调用的公共部分：拼 prompt → 图片/超长附件上传 → 调 web.chat → 解析工具调用。
@@ -68,6 +68,21 @@ export function createChatRunner({ config, log, web }) {
     onPrompt?.(prompt, { stats, attachment: initial.attachment });
 
     const knownTools = toolNames.length ? toolNames : null;
+    const knownToolSet = knownTools ? new Set(knownTools) : null;
+    // 工具声明的 schema：原来 evaluate 只知道工具名，参数类型错了也原样
+    // 发给客户端。现在按声明纠正一次可还原的类型错误（见 tools.mjs）。
+    const toolSchemas = getToolSchemas(request.tools);
+    const finalizeToolCalls = (calls) =>
+      calls.map((call) => {
+        const { arguments: coerced, warnings } = coerceToolCallArguments(call, toolSchemas);
+        if (warnings.length) {
+          log?.warn('工具调用参数与声明不符（已纠正可还原的部分，缺失值未编造）', {
+            name: call.name,
+            warnings,
+          });
+        }
+        return coerced === call.arguments ? call : { ...call, arguments: coerced };
+      });
 
     /**
      * 把一段原始输出整理成协议无关的语义：有效工具调用 + 干净正文。
@@ -79,7 +94,8 @@ export function createChatRunner({ config, log, web }) {
       const parsed = parseToolCalls(text, knownTools);
       // 不再做「重复调用抑制」：agent 里同一个调用原样重发是正常操作（每一步之后重新 observe_screen），
       // 按签名去重会把整轮输出吞成空回答。
-      const toolCalls = parsed;
+      // 但参数要按声明纠正一次：模型常把数字/布尔/数组写成字符串，见 tools.mjs。
+      const toolCalls = finalizeToolCalls(parsed);
       const content = stripToolMarkup(text);
 
       // 诊断（只记日志，不改行为）：这一轮既没有正文、也没有工具调用时，客户端收到的是一条
@@ -97,17 +113,22 @@ export function createChatRunner({ config, log, web }) {
           log?.warn('解析出了工具调用但没交给客户端（不该发生，检查 evaluate 的过滤逻辑）', {
             names: parsed.map((call) => call.name),
           });
-        } else if (findToolMarkup(text).length) {
-          log?.warn('模型输出了协议块，但没解析出任何工具调用（工具名不在声明里，或 DSML 结构对不上）', {
-            protocolBlocks: findToolMarkup(text).map((block) => block.kind),
-          });
+        } else {
+          // 原来这里调用了两次 findToolMarkup（一次判空、一次取 kind），
+          // 协议扫描是全文正则，空回答分支下白跑一遍；算一次复用。
+          const blocks = findToolMarkup(text);
+          if (blocks.length) {
+            log?.warn('模型输出了协议块，但没解析出任何工具调用（工具名不在声明里，或 DSML 结构对不上）', {
+              protocolBlocks: blocks.map((block) => block.kind),
+            });
+          }
         }
       }
 
       // 未知工具名是「模型自己在乱叫」的信号：照实返回（客户端会回一条 unknown tool 让它纠正），
       // 但不能静默——以前这里连日志都没有，出事只能靠猜。
-      if (toolCalls.length && knownTools) {
-        const unknown = toolCalls.filter((call) => !knownTools.includes(call.name));
+      if (toolCalls.length && knownToolSet) {
+        const unknown = toolCalls.filter((call) => !knownToolSet.has(call.name));
         if (unknown.length) {
           log?.warn('模型调用了未声明的工具，已照实返回给客户端', {
             names: unknown.map((call) => call.name),
@@ -127,7 +148,7 @@ export function createChatRunner({ config, log, web }) {
     /** 可见正文为空时，工具调用可能只写在思考里（DeepSeek 的常见行为）：提升成正式调用 */
     const promoteFromReasoning = (reasoning, reply) => {
       if (reply.content.trim() || reply.toolCalls.length || !reasoning) return reply;
-      const toolCalls = parseToolCalls(reasoning, knownTools);
+      const toolCalls = finalizeToolCalls(parseToolCalls(reasoning, knownTools));
       return toolCalls.length ? { ...reply, toolCalls } : reply;
     };
 

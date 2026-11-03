@@ -11,7 +11,7 @@ import {
   typingDelay,
 } from './fingerprint.mjs';
 import { PowSolver } from './pow.mjs';
-import { applyPatch, createSseParser, createStreamState } from './stream.mjs';
+import { applyPatch, createSseParser, createStreamState, createTextTracker } from './stream.mjs';
 
 const COMPLETION_PATH = '/api/v0/chat/completion';
 const UPLOAD_PATH = '/api/v0/file/upload_file';
@@ -349,26 +349,35 @@ export class DirectEngine {
         let emittedContent = '';
         let emittedReasoning = '';
         let firstTokenAt = 0;
+        // 增量追踪器：正常追加时只 join 新增量，不拼全文（见 stream.mjs）。
+        // 追踪器返回 null（片段被改写/回退）时回退到全文 join + 前缀校验。
+        const contentTracker = createTextTracker();
+        const reasoningTracker = createTextTracker();
+
+        const emitOne = (tracker, type, emitted, onEmit) => {
+          const delta = tracker(state.fragments, type);
+          if (delta) {
+            if (!firstTokenAt) firstTokenAt = Date.now();
+            onEmit?.(delta);
+            return emitted + delta;
+          }
+          if (delta === null) {
+            const full = state.fragments
+              .filter((f) => f?.type === type)
+              .map((f) => f.content || '')
+              .join('');
+            if (full.length > emitted.length && full.startsWith(emitted)) {
+              if (!firstTokenAt) firstTokenAt = Date.now();
+              onEmit?.(full.slice(emitted.length));
+              return full;
+            }
+          }
+          return emitted;
+        };
 
         const emit = () => {
-          const content = state.fragments
-            .filter((f) => f?.type === 'RESPONSE')
-            .map((f) => f.content || '')
-            .join('');
-          if (content.length > emittedContent.length && content.startsWith(emittedContent)) {
-            if (!firstTokenAt) firstTokenAt = Date.now();
-            onDelta?.(content.slice(emittedContent.length));
-            emittedContent = content;
-          }
-          const reasoning = state.fragments
-            .filter((f) => f?.type === 'THINK')
-            .map((f) => f.content || '')
-            .join('');
-          if (reasoning.length > emittedReasoning.length && reasoning.startsWith(emittedReasoning)) {
-            if (!firstTokenAt) firstTokenAt = Date.now();
-            onThinking?.(reasoning.slice(emittedReasoning.length));
-            emittedReasoning = reasoning;
-          }
+          emittedContent = emitOne(contentTracker, 'RESPONSE', emittedContent, onDelta);
+          emittedReasoning = emitOne(reasoningTracker, 'THINK', emittedReasoning, onThinking);
         };
 
         const parser = createSseParser((payload, event) => {
@@ -519,6 +528,16 @@ export class DirectEngine {
     const hash = crypto.createHash('sha256').update(buffer).digest('hex');
     const cached = this.fileCache.get(hash);
     if (cached && cached.expiresAt > Date.now()) return cached.id;
+    // 原来只在命中时检查过期：长期运行的进程里过期条目永远不删，
+    // Map 会随上传次数无限增长。这里在写入前顺手清掉过期项并设上限。
+    if (cached) this.fileCache.delete(hash);
+    if (this.fileCache.size >= 512) {
+      const now = Date.now();
+      for (const [key, entry] of this.fileCache) {
+        if (entry.expiresAt <= now) this.fileCache.delete(key);
+      }
+      if (this.fileCache.size >= 512) this.fileCache.delete(this.fileCache.keys().next().value);
+    }
 
     const powHeader = await this.#powHeaderFor(account, UPLOAD_PATH);
     const form = new FormData();

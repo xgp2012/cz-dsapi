@@ -209,23 +209,23 @@ function buildNote(name, sections) {
   return [
     '',
     '## CONTEXT_ATTACHMENT:',
-    `本次上下文较长，较早的 ${sections} 个段落已作为附件「${name}」上传（可能包含系统提示、工具声明或早期对话）。`,
-    '附件使用与正文相同的 ## 段落格式（## System: / ## User: / ## Assistant: / ## Tool_calls: / ## Tool_call_result:）。',
-    '请先阅读附件，把它当作本次对话的早期历史，再接续下面的段落回答。不要向用户提及附件或本说明。',
+    `This context is long: the earlier ${sections} sections have been uploaded as attachment "${name}" (they may contain system prompts, tool declarations, or earlier conversation).`,
+    'The attachment uses the same ## section format as the main text (## System: / ## User: / ## Assistant: / ## Tool_calls: / ## Tool_call_result:).',
+    'Read the attachment first, treat it as the earlier history of this conversation, then continue with the sections below. Do not mention the attachment or this note to the user.',
     '',
   ].join('\n');
 }
 
 function buildMarker(name, cut) {
-  return `\n（本段较长，前 ${cut} 字在附件 ${name} 中，以下为续）\n`;
+  return `\n(This section is long; its first ${cut} characters are in attachment ${name}, continued below)\n`;
 }
 
 function buildAttachmentTitle(sections) {
   return [
-    '# 对话历史（较早部分）',
+    '# Conversation history (earlier part)',
     '',
-    `这是本次对话中较早的 ${sections} 个段落，因为超出网页输入框长度上限，被拆到本文件。`,
-    '段落格式与正文一致：## System: / ## Tool_functions: / ## User: / ## Assistant: / ## Tool_calls: / ## Tool_call_result:。',
+    `These are the earlier ${sections} sections of this conversation, moved to this file because they exceeded the web input length limit.`,
+    'Section format matches the main text: ## System: / ## Tool_functions: / ## User: / ## Assistant: / ## Tool_calls: / ## Tool_call_result:.',
     '',
   ].join('\n');
 }

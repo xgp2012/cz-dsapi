@@ -112,7 +112,7 @@ test('最后一段自己就超长：保留尾部，前面进附件', () => {
   assert.ok(!plan.prompt.includes('BIGSTART'), '开头应该在附件里');
   assert.match(plan.prompt, /BIGEND/);
   assert.match(text, /BIGSTART/);
-  assert.match(plan.prompt, /本段较长/);
+  assert.match(plan.prompt, /continued below/);
 });
 
 test('附件超过上限时报错', () => {
