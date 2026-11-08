@@ -23,7 +23,7 @@
 12. [管理后台](#12-管理后台)
 13. [配置系统](#13-配置系统)
 14. [测试体系与本地验证](#14-测试体系与本地验证)
-    - [14.7 打包成 Windows 单 exe](#147-打包成-windows-单-exescriptsbuild-exemjs)
+    - [14.7 打包成 Windows 单 exe](#147-打包成-windows-单-exescriptsbuild-exemjs) · [14.8 Docker 镜像](#148-docker-镜像dockerfile) · [14.9 CI 构建镜像](#149-cigithub-actions-构建镜像githubworkflowsdockeryml)
 15. [已知问题与技术债](#15-已知问题与技术债)
 16. [常见开发任务：改哪里](#16-常见开发任务改哪里)
 17. [调试手册](#17-调试手册)
@@ -102,6 +102,23 @@ src/auth.mjs             userToken 归一化、读写 data/auth.json、打码
 src/net-guard.mjs        SSRF 防护：URL 白名单 / 私网段判定 / 连接期 IP 校验 / 安全下载（不跟随重定向）
 src/rate-limit.mjs       入口限流的 IP 令牌桶 + clientIp（可信代理判定）
 ```
+
+**交付与 CI（不进 src/，但改发布流程时必看）**：
+
+```
+Dockerfile              三阶段镜像：web 构建 → Go 求解器 → 精简运行时（见 §14.8）
+.dockerignore           23 条排除规则，把 dist/(300MB)、node_modules 挡在构建上下文外
+.gitattributes          强制 LF，*.bat 例外保持 CRLF（见 §14.8「换行符事故」）
+.github/workflows/
+  docker.yml            唯一工作流：push 即构建并推 ghcr.io（见 §14.9）
+scripts/build-exe.mjs   打 Windows 单 exe（见 §14.7）
+scripts/package.mjs     打源码 zip（不含 node_modules / data / .env）
+```
+
+> `.dockerignore` 里的 `dist/` 和 `bin/` 不是可选的：前者是 300MB 的 Windows 产物，
+> 后者是 Go 编译输出。两者都靠 Dockerfile 的 builder 阶段重新产出，从构建上下文拷必然失败
+> （而且 `bin/` 在 `.gitignore` 里，CI 上根本不存在）。
+
 
 ### 3.2 协议层
 
@@ -1114,6 +1131,18 @@ go test ./... && go test -bench=. -benchmem
 > 因此 `cmd` / PowerShell / bash 下跑的都是同一批文件，不会再出现"0 个用例静默通过"的假绿（原 T1 已修复）。
 > 透传参数：`npm test -- --test-name-pattern="DSML"`。
 
+**交付物的验证命令**（不属于 `npm test`，按需运行）：
+
+```bash
+npm run exe                              # Windows exe：内含启动自检 + Chromium 自检，失败会中断
+docker build -t fuckds .                 # Docker（需要本地有 docker）
+gh run list --repo <owner>/<repo>        # 看 CI 结果
+```
+
+`npm run exe` 的自检是**构建流程的一部分**，不是可选的：它会真的把打出来的 exe 拉起来
+监听一个随机端口、等它打印启动横幅；带 Chromium 时还会启动浏览器读一次页面文本。
+任何一步失败就 `die()`，不会产出坏包。
+
 ### 14.3 本仓库实测基线（2026-11，Windows 11 / Node 24.22 / Go 1.27）
 
 在干净目录下按上面的步骤跑完 `npm install` + `npm run pow:build` 后：
@@ -1183,6 +1212,7 @@ go test ./... && go test -bench=. -benchmem
 | Chromium 定位 | `browser/env.mjs#resolveChromiumExecutable` 按平台找缓存根目录（Windows `%LOCALAPPDATA%\ms-playwright`、macOS `~/Library/Caches`、Linux `~/.cache`），并在每个 `chromium-*` 目录里依次试 `chrome-linux64/`、`chrome-linux/`（及 win/mac 对应路径）；`CHROMIUM_EXECUTABLE` 优先级最高 |
 | 发布包 | `npm run package`：排除 node_modules / data / .env / 测试产物 / .git，`web/dist` 若已构建会带上 |
 | Windows exe | `npm run exe`：产出 `dist/win-x64/` + zip，目标机器零安装。见 §14.7 |
+| Docker 镜像 | `Dockerfile`：三阶段构建，CI 推到 ghcr.io。见 §14.8 / §14.9 |
 
 ### 14.7 打包成 Windows 单 exe（`scripts/build-exe.mjs`）
 
@@ -1298,7 +1328,159 @@ SEA 内嵌的代码**一律按 CommonJS 执行**。实测 Node 24，内嵌一个
 > 提示框用纯 ASCII 的 `=` 和 `|` 画，不用 `╔═╗` —— 后者在 Windows 控制台默认字体下是乱码（实测）。
 
 `.env` / `data/auth.json` / 环境变量这三种方式仍然有效，适合无人值守部署。
-| 仓库里的大文件 | 根目录 `fuckds.zip`（约 20MB）是历史发布包，不影响运行，见 §15 T11 |
+
+### 14.8 Docker 镜像（`Dockerfile`）
+
+三种交付形态的分工：
+
+| 形态 | 产物 | 目标机器需要装什么 | 适合 |
+|---|---|---|---|
+| 源码 | 整仓 | Node 20.11+ / Go 1.23+ / Chromium | 开发、调试 |
+| Windows exe | `dist/win-x64/` + zip | **什么都不装** | 给不懂技术的 Windows 用户 |
+| Docker 镜像 | `ghcr.io/xgp2012/cz-dsapi` | 只要 Docker | **服务器 / NAS** |
+
+#### 三阶段结构
+
+```
+web      node:22-bookworm-slim   npm ci（含 devDeps）→ vite build → web/dist
+pow      golang:1.23-bookworm    CGO_ENABLED=0 go build → /out/ds-pow（静态二进制）
+runtime  node:22-bookworm-slim   apt 运行时库 + 生产依赖 + chromium-headless-shell
+                                 + src/ + web/dist + bin/ds-pow
+```
+
+前两个阶段的工具链**不进最终镜像**。`web/dist` 和 `bin/ds-pow` 都只能从 builder 阶段
+`COPY --from=` 拿 —— 它们在 `.gitignore` 里，构建上下文里没有。
+
+#### 为什么默认 `ENGINE=direct`
+
+镜像里编好了 Go 求解器，`direct` 比 `browser` 快得多，而且不需要常驻 Chromium（省内存）。
+想用浏览器引擎就 `-e ENGINE=browser`，镜像里 `chromium-headless-shell` 已经装好。
+
+`HOST=0.0.0.0` 是**必须**的：容器里只监听 `127.0.0.1` 的话端口映射不出去。
+
+#### 镜像里的可写路径只有两处
+
+| 路径 | 内容 | 是否需挂卷 |
+|---|---|---|
+| `/app/data/` | `auth.json`（号池）、`server.log` | **是**，否则重建容器号池就丢 |
+| `/app/.env` | 「设置」页写回的配置 | 可选；容器里更推荐用 `-e` 环境变量 |
+
+除这两处外 `/app` 全是 root 只读，进程以 `node`（uid 1000）运行。
+`config.mjs#loadConfig` 里的 `fs.mkdirSync(dataDir)` 在目录已存在时不报错，
+所以 `DATA_DIR` 指向一个已 `chown` 好且挂载了卷的目录即可。
+
+#### 镜像瘦身：两个坑（420MB → 205MB）
+
+**坑 1：`chown -R` 会把整个目录复制进新的一层。**
+
+```dockerfile
+RUN mkdir -p /app/data && chown -R node:node /app    # ← 109MB 白胖
+```
+
+镜像层是**增量快照**：`chown -R /app` 会改动 `/app` 下每个文件的元数据，
+Docker 必须把刚装好的 Chromium（210MB 未压缩）整份复制进新层来记录新属主。
+实测这一句贡献了 109MB（压缩后）。
+
+改成只 chown 数据目录即可 —— 其余文件 root 只读，`node` 用户运行时不需要写权限：
+
+```dockerfile
+RUN mkdir -p /app/data && chown -R node:node /app/data
+```
+
+**坑 2：`playwright install --with-deps` 会再跑一遍 apt。**
+
+系统库已经在前面用 apt 装好了，`--with-deps` 又装一次，多出一层（1.6MB + 层数增加）。
+Chromium 本体 105.8MB 是省不掉的，其余层都是系统基础镜像。
+
+> 排障提示：`docker history` 看不到真实体积（它显示的是未压缩大小）。
+> 想知道哪层肥，直接读 Registry API 的 manifest —— 每层有 `size` 字段，这是压缩后的。
+
+#### 换行符事故（务必保持 `.gitattributes`）
+
+Windows 上 git 默认把 LF 转 CRLF 提交。这会直接毁掉 Dockerfile：
+
+```dockerfile
+RUN apt-get update && apt-get install -y \
+    ca-certificates
+```
+
+CRLF 下行尾的 `\` 变成字面量 `\` + `\r`，`apt-get` 收到一个叫 `ca-certificates\r` 的包名，
+构建报「Unable to locate package」。同理 shell 脚本会 `bad interpreter: /bin/bash^M`。
+
+`.gitattributes` 强制 `* text=auto eol=lf`，只对 `*.bat` / `*.cmd` 保留 CRLF
+（cmd 解析 CRLF 才正常）。**新增需要 CRLF 的文件类型记得加进去。**
+
+#### 本地构建
+
+```bash
+docker build -t fuckds .
+docker run -d -p 8787:8787 -e DEEPSEEK_USER_TOKEN=<token> -v fuckds-data:/app/data fuckds
+```
+
+不需要先跑 `npm run admin:build` 或 `npm run pow:build`，构建过程会做。
+
+### 14.9 CI：GitHub Actions 构建镜像（`.github/workflows/docker.yml`）
+
+设计目标是**快**，所以刻意做减法：
+
+| 做法 | 原因 |
+|---|---|
+| 只构建 `linux/amd64` | 多架构（+arm64）靠 QEMU 模拟，构建时间翻几倍；需要 arm 时再单独加 |
+| `cache-from/to: type=gha` | 第二次起只重跑变化的层，实测 2m49s → 52s |
+| 不跑测试、不跑 lint | 测试在本地 `npm test` 跑；CI 只负责出镜像 |
+| 不写 `workflow_dispatch` 之外的触发 | push 到 master/main 或打 `v*` tag 就构建 |
+
+#### 缓存的实际效果
+
+改 `Dockerfile` 末尾的层（如 `chown`）时，`web` 和 `pow` 阶段全部命中缓存，
+只有 `runtime` 阶段的后半段重跑，整体 52s。改 `src/` 也一样 —— 它在最后几层。
+
+相反，改 `package.json` 会让 `npm ci` 之后的层全部失效；改 `web/package.json`
+会让 `web` 阶段重建。**想保持构建快，就别频繁动依赖清单。**
+
+#### 标签规则
+
+`docker/metadata-action` 生成：
+
+| 触发 | 标签 |
+|---|---|
+| push 到 master | `master`、`latest` |
+| tag `v1.2.3` | `v1.2.3`、`1.2.3`、`1.2`、`latest` |
+
+`latest` 只跟随默认分支（`enable={{is_default_branch}}`），避免旧分支覆盖。
+
+#### 权限与可见性
+
+workflow 里 `permissions: packages: write` + `secrets.GITHUB_TOKEN` 即可推送，
+不需要额外配 PAT。
+
+但 **ghcr 的包默认继承仓库可见性，首次推送后仍建议手动确认**：仓库是 public 时包
+通常也是 public，但 GitHub 的默认值变过。验证方法（不需要 docker）：
+
+```bash
+# 走 Registry v2 的匿名 token 流程，能拿到 manifest 就是公开的
+curl -s "https://ghcr.io/token?service=ghcr.io&scope=repository:xgp2012/cz-dsapi:pull"
+# 拿到 token 后：
+curl -s -H "Authorization: Bearer <token>" \
+  -H "Accept: application/vnd.oci.image.index.v1+json" \
+  https://ghcr.io/v2/xgp2012/cz-dsapi/manifests/latest
+```
+
+直接请求 `/v2/.../manifests/latest` 会返回 **401** —— 那是 Registry 的认证挑战，
+不代表镜像私有，别被它误导。
+
+#### 没有本地 Docker 时怎么验证镜像
+
+本仓库开发机上没有 Docker，所以 CI 是唯一的构建环境。这种情况下能验的三件事：
+
+1. **Dockerfile 静态检查**：每个 `COPY` 的源在上下文里存在且**没被 `.dockerignore` 排除**；
+   `COPY --from=` 的阶段名拼写正确。这一步能提前抓到"从上下文拷 `bin/`"这类必失败写法。
+2. **看 CI 日志**确认构建通过。
+3. **读 Registry API 的 image config**，确认 `Entrypoint` / `User` / `Env` / `Healthcheck`
+   真的按 Dockerfile 生成了，以及各层大小。
+
+第 3 步特别值得做：它验证的是**镜像里的实际配置**，而不是"Dockerfile 看起来对"。
+
 
 ---
 
@@ -1321,6 +1503,9 @@ SEA 内嵌的代码**一律按 CommonJS 执行**。实测 Node 24，内嵌一个
 | T10 | `browser` 引擎没有多账号 | 限流窗口一到就 429 | 可复用 `AccountPool`，轮换 token 后重建 context |
 | T11 | `fuckds.zip`（约 20MB）躺在仓库根目录 | 克隆变慢 | 移出仓库或用 Releases |
 | T12 | PoW 的 NEON 汇编只在 arm64；其他平台走纯 Go | 无功能问题，但性能数字要注明平台 | 文档已注明。另：`POW_WORKERS` 原先到不了子进程（死配置），已在 §14.4 修好；多并发 solve 仍会各起 `NumCPU` 个 goroutine 互相抢核，改成共享原子计数器取块能再改善（未做） |
+| T14 | CI 只构建 `linux/amd64`，arm64（Apple Silicon / 部分 NAS）拉不到镜像 | 用 `--platform linux/amd64` 走模拟能跑，但慢 | 需要时给 `docker.yml` 加 `platforms: linux/amd64,linux/arm64` + `setup-qemu-action`，构建时间约翻倍 |
+| T15 | 镜像里的 Chromium 是固定 revision，与 `package.json` 的 playwright 版本绑死 | 升级 playwright 忘记重建镜像 → 运行时报"Executable doesn't exist" | CI 已经是 push 即重建，正常流程不会漏；手动改基镜像时注意 `playwright install` 用的是 `node_modules` 里那个版本 |
+| T16 | 开发机没有 Docker，镜像只能靠 CI 构建后间接验证 | 无法本地 `docker run` 复现容器内问题 | 已在 §14.9 给出三步替代验证（静态检查 / CI 日志 / 读 Registry config）。有 Docker 的机器建议至少跑一次 `docker run` 验证 browser 引擎 |
 
 ---
 
@@ -1385,7 +1570,7 @@ DNS 解析后的 IP 校验、连接期再校验（防 rebinding）、不跟随�
 若要放宽限制（比如支持内网 MinIO），**不要**改 `isBlockedAddress` 的默认段，
 而是加一个显式的白名单配置项，并在文档里写清楚风险 —— 默认行为必须保持"拒绝内网"。
 
-### 16.6 优化性能
+### 16.8 优化性能
 
 先定位是**哪一段**：
 
@@ -1401,9 +1586,29 @@ DNS 解析后的 IP 校验、连接期再校验（防 rebinding）、不跟随�
 先看请求到底卡在哪个闸门，再去调参数。
 
 **不要动**：`pollIntervalMs`、`settleMs`、号池冷却/换号逻辑 —— 它们不是"冗余"，调小会直接增加截断/丢尾风险。
-`PROTOCOL_LOOKAHEAD` 同样不能随便调小（见 §10.2）。
 `SPECIAL_TOKENS_HEADER` / `DEFAULT_RESERVE` / `DEFAULT_MIN_DIALOG_CHARS` 也不要为了"全绿"去改（见 §14.3）。
-`PROTOCOL_LOOKAHEAD` 也不能随便调小（见 §10.2）。
+`PROTOCOL_LOOKAHEAD` 同样不能随便调小（见 §10.2）。
+
+### 16.9 改发布流程 / 加一种交付形态
+
+现状是三种形态（源码 / Windows exe / Docker），共用同一份 `src/`。加新形态时按这个清单走：
+
+| 检查项 | 为什么 |
+|---|---|
+| 入口怎么拿到 `ROOT` | `config.mjs` 用 `FUCKDS_ROOT`（打包态）或 `src/` 的上一级（源码态）。新形态若目录布局不同，必须设 `FUCKDS_ROOT` |
+| 可写目录有哪几个 | 只有 `data/`（号池 + 日志）和 `.env`。只读文件系统要保证这两处可写，否则 `loadConfig` 的 `mkdirSync` 会崩 |
+| 引擎要满足什么前提 | `direct` 需要 `bin/ds-pow`；`browser` 需要 Chromium。缺任一项都靠 `UnconfiguredEngine` 兜底（服务能起、请求报 400），别写成立刻退出 |
+| 重启怎么实现 | 见 §14.7 末尾。`process.execPath` 是不是解释器，决定了能不能复用 `server-ctl.mjs` |
+| 首次配置怎么引导 | 不用做，控制台会自己探测 `/healthz` 的 `hasToken` 并跳到「账号」页 |
+| 大文件怎么处理 | `dist/`(300MB)、`bin/`(Go 产物)、`node_modules/` 都该在构建时重建，不要进镜像/包 |
+
+Docker 相关的两个必查项单独列一下，它们最容易漏：
+
+1. **`.dockerignore` 里排掉的东西，就不能 `COPY --from` 之外的方式引用。**
+   本项目的 `web/dist` 和 `bin/ds-pow` 都在 `.gitignore` 里 → CI 上不存在 →
+   只能从 builder 阶段拷。写过 `COPY bin/ ./bin/` 会直接构建失败。
+2. **`.gitattributes` 的 LF 规则。** Dockerfile 的 `\` 续行遇到 CRLF 会断，
+   shell 脚本会 `bad interpreter`。新增文件类型时想清楚该用哪种换行。
 
 ---
 

@@ -4,11 +4,12 @@
 
 | 文档 | 内容 |
 |---|---|
-| [开发文档](./DEVELOPMENT.md) | 架构、模块职责、请求全链路、引擎契约、**并发模型**、上游协议、Prompt/工具调用、**安全加固**、错误与重试、测试、调试、技术债 |
+| [开发文档](./DEVELOPMENT.md) | 架构、模块职责、请求全链路、引擎契约、**并发模型**、上游协议、Prompt/工具调用、**安全加固**、错误与重试、测试、**Docker 镜像与 CI**、调试、技术债 |
 | [环境变量样例](../.env.example) | 全部配置项与默认值 |
+| [Dockerfile](../Dockerfile) · [.dockerignore](../.dockerignore) · [workflow](../.github/workflows/docker.yml) | 交付形态的定义文件 |
 
 > 早先引用的 `OPTIMIZATION.md` 已不存在，其中的"不要动的地方"已并入
-> [开发文档 §14.5](./DEVELOPMENT.md#145-并发与性能本轮新增) 与 [§16.6 优化性能](./DEVELOPMENT.md#166-优化性能)。
+> [开发文档 §14.5](./DEVELOPMENT.md#145-并发与性能本轮新增) 与 [§16.8 优化性能](./DEVELOPMENT.md#168-优化性能)。
 
 ## 3 分钟上手
 
@@ -20,9 +21,15 @@ npm run auth -- '<userToken>'
 npm start              # 前台跑；或用 npm run up 后台跑
 npm test               # 272 个用例（253 + 19 浏览器）；没有 Chromium 时浏览器用例会自动 skip
 npm run exe            # 打包成 Windows 单 exe → dist/win-x64/（目标机器零安装）
+docker build -t fuckds .   # 构建镜像（需要本地有 docker）
 ```
 
 前端控制台需要单独构建一次：`npm run admin:install && npm run admin:build`，然后访问 `/admin`。
+（Docker 构建会自动完成这两步，不需要在宿主机上跑。）
+
+> **第一次启动不需要配 token**：控制台会自动探测 `hasToken` 并跳到「账号」页引导粘贴。
+> 服务在未配置状态下照常监听，只有真正发对话请求时才返回 400。见
+> [§14.7 首次配置](./DEVELOPMENT.md#首次运行的登录态控制台引导不需要碰配置文件)。
 
 ## 改代码前必读
 
@@ -40,14 +47,24 @@ npm run exe            # 打包成 Windows 单 exe → dist/win-x64/（目标机
 
 ## 分发
 
-| 方式 | 命令 | 目标机器需要 |
-|---|---|---|
-| 源码包 | `npm run package` | Node 20+ / Go / Chromium |
-| Windows exe | `npm run exe` | **什么都不用装**（解压即用） |
+| 方式 | 命令 | 目标机器需要 | 适合 |
+|---|---|---|---|
+| 源码包 | `npm run package` | Node 20+ / Go / Chromium | 开发、调试 |
+| Windows exe | `npm run exe` | **什么都不用装**（解压即用） | 不懂技术的 Windows 用户 |
+| Docker 镜像 | CI 自动推 `ghcr.io/xgp2012/cz-dsapi` | 只要 Docker | 服务器 / NAS |
 
 exe 产物里 `src/`、`node_modules/`、`ms-playwright/` 必须和 `fuckds.exe` 同目录 ——
 SEA 内嵌代码只能按 CommonJS 执行，装不下 ESM 源码。原因与两个 playwright 坑见
 [§14.7 打包成 Windows 单 exe](./DEVELOPMENT.md#147-打包成-windows-单-exescriptsbuild-exemjs)。
+
+镜像侧三个最容易踩的点（详见 [§14.8](./DEVELOPMENT.md#148-docker-镜像dockerfile)）：
+
+- `web/dist` 和 `bin/ds-pow` **只能从 builder 阶段拷**，它们在 `.gitignore` 里，CI 上不存在；
+- `chown -R /app` 会因镜像层增量快照把整个 Chromium 复制一遍（实测 +109MB），只 chown `data/`；
+- Dockerfile 的 `\` 续行遇到 CRLF 会断，靠 [`.gitattributes`](../.gitattributes) 强制 LF。
+
+CI 细节（缓存、标签规则、如何在没有本地 Docker 时验证）见
+[§14.9](./DEVELOPMENT.md#149-cigithub-actions-构建镜像githubworkflowsdockeryml)。
 
 ## 定位问题的三个入口
 
@@ -59,5 +76,7 @@ SEA 内嵌代码只能按 CommonJS 执行，装不下 ESM 源码。原因与两�
 | 429 / 被限流 / 被陌生人调用 | [5.5 入口限流](./DEVELOPMENT.md#55-入口限流srcrate-limitmjs)、[17.1 日志](./DEVELOPMENT.md#171-日志) |
 | 长回答越跑越慢 | [10.2 流式过滤器性能](./DEVELOPMENT.md#性能这里曾经是-on改动前务必看懂) |
 | 并发上不去 / 全都压在一个号上 | [6.5 并发模型](./DEVELOPMENT.md#65-并发模型两条流水线) |
+| 镜像构建失败 / 体积异常 / 拉不到镜像 | [14.8 Docker 镜像](./DEVELOPMENT.md#148-docker-镜像dockerfile)、[14.9 CI](./DEVELOPMENT.md#149-cigithub-actions-构建镜像githubworkflowsdockeryml) |
+| exe 起不来 / 重启失败 | [14.7 打包成 Windows 单 exe](./DEVELOPMENT.md#147-打包成-windows-单-exescriptsbuild-exemjs) |
 
 > 本文档基于仓库当前源码逐文件核对编写；文中引用的方法名、常量值与分支条件均对应实际实现。改动相关代码时请顺手同步对应章节。
