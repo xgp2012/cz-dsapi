@@ -96,6 +96,57 @@ npm run down      # 停止
 > 如果配置了 `API_KEY`，打开 `/admin` 会弹框要求输入同一个 key（存在浏览器 localStorage，右上角钥匙图标可修改 / 清除）。
 > 开发前端时用 `npm run admin:dev`（Vite 会热更新并把 /admin/api、/v1 代理到 8787）。
 
+### 2.5 用 Docker 跑（推荐给服务器）
+
+不需要装 Node、Go 或 Chromium —— 镜像里都带好了（含编译好的 Go PoW 求解器）。
+
+```bash
+docker run -d --name fuckds \
+  -p 8787:8787 \
+  -e DEEPSEEK_USER_TOKEN=<你的 userToken> \
+  -v fuckds-data:/app/data \
+  --restart unless-stopped \
+  ghcr.io/xgp2012/cz-dsapi:latest
+```
+
+`-v fuckds-data:/app/data` 别省：号池和日志都在里面，不挂卷重建容器就丢了。
+
+也可以第一次**不传 token**，启动后打开 <http://127.0.0.1:8787/admin/>，
+控制台会自动跳到「账号」页引导你粘贴 —— 和本地跑完全一样的流程。
+
+常用变体：
+
+```bash
+# 想加一层自己的鉴权（不设的话任何能访问端口的人都能用你的账号）
+docker run -d -p 8787:8787 \
+  -e DEEPSEEK_USER_TOKEN=<token> \
+  -e API_KEY=<自己设一个> \
+  -v fuckds-data:/app/data \
+  ghcr.io/xgp2012/cz-dsapi:latest
+
+# 切到浏览器引擎（镜像里已装 chromium-headless-shell）
+docker run -d -p 8787:8787 -e ENGINE=browser \
+  -e DEEPSEEK_USER_TOKEN=<token> \
+  -v fuckds-data:/app/data \
+  ghcr.io/xgp2012/cz-dsapi:latest
+```
+
+默认引擎是 `direct`（用镜像内置的 Go 求解器，更快、不吃内存）。
+镜像默认 `HOST=0.0.0.0`，容器里必须这样端口才映射得出去。
+
+<details>
+<summary>自己构建镜像</summary>
+
+```bash
+docker build -t fuckds .
+docker run -d -p 8787:8787 -e DEEPSEEK_USER_TOKEN=<token> -v fuckds-data:/app/data fuckds
+```
+
+Dockerfile 是三阶段的（控制台 → Go 求解器 → 运行时），前两阶段的工具链不进最终镜像。
+`web/dist` 和 `bin/ds-pow` 都在构建时产出，不需要本地先跑 `npm run admin:build` 或 `npm run pow:build`。
+
+</details>
+
 ### 3. 调用
 
 ```bash
