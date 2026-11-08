@@ -22,6 +22,15 @@ const API_ERROR_MAX_RETRIES = 3;
 const API_ERROR_RETRY_DELAY_MS = 500;
 
 /**
+ * 每个账号最多预解几个 PoW。
+ *
+ * 只留 1 个时，两个并发请求里第二个必然拿不到、要现场解（多花一次 80–200ms）；
+ * 但 PoW 有 expire_at（通常几分钟），预解太多会白白过期浪费 CPU。
+ * 2 个足以覆盖常见的"agent 并发发两个请求"，且过期风险低。
+ */
+const POW_POOL_SIZE = 2;
+
+/**
  * 登录态失效的账号停用多久（毫秒）。
  *
  * token 失效不会自己恢复，换 token / 重启进程之前都不该再选它；
@@ -84,8 +93,19 @@ export class DirectEngine {
       ? config.deepseek.tokens
       : [config.deepseek.token].filter(Boolean);
 
-    this.pool = new AccountPool({ tokens: this.tokens, dataDir: config.dataDir, logger });
-    this.pow = new PowSolver({ bin: config.direct.powBin, logger });
+    this.pool = new AccountPool({
+      tokens: this.tokens,
+      dataDir: config.dataDir,
+      logger,
+      maxInflightPerAccount: config.direct.maxInflightPerAccount,
+    });
+    // 显式把 POW_WORKERS 下发给求解器：.env 里的值原来永远到不了子进程（死配置）。
+    // powWorkers = 0 表示不设置，交给 Go 用 runtime.NumCPU()。
+    const powEnv = { ...process.env };
+    const workers = Number(config.direct.powWorkers);
+    if (Number.isFinite(workers) && workers > 0) powEnv.POW_WORKERS = String(Math.floor(workers));
+    else delete powEnv.POW_WORKERS;
+    this.pow = new PowSolver({ bin: config.direct.powBin, logger, env: powEnv });
     this.fileCache = new Map();
     this.inflight = 0;
     this.closed = false;
@@ -109,7 +129,7 @@ export class DirectEngine {
     if (!account) return;
     this.#prefetchPow(account);
     this.#prewarmSession(account);
-    await account.powNext?.catch((err) => this.log.warn('PoW 预热失败:', err.message));
+    await account.powPending?.catch((err) => this.log.warn('PoW 预热失败:', err.message));
 
     // 冷启动：让账号在服务端有一份「网页打开过」的痕迹，
     // 而不是凭空开始发 API 请求。失败不影响主流程。
@@ -186,17 +206,20 @@ export class DirectEngine {
           continue;
         }
 
+        // 归还 inflight 名额：用 try/finally 包住整个 "用这个号干活" 的过程，
+        // 因为下面有多条 continue / throw 路径，漏掉任何一条都会让该账号的
+        // inflight 只增不减，最终被永久锁死（maxInflightPerAccount 时尤其致命）。
         try {
-          const result = await this.#run({
-            account, prompt, thinking, search, refFileIds, signal, onDelta, onThinking, startedAt, meta,
-          });
-          this.pool.markHealthy(account);
-          return result;
-        } catch (err) {
+          try {
+            const result = await this.#run({
+              account, prompt, thinking, search, refFileIds, signal, onDelta, onThinking, startedAt, meta,
+            });
+            this.pool.markHealthy(account);
+            return result;
+          } catch (err) {
           if (signal?.aborted) throw err;
           // 客户端断开 / 超时 / 参数问题：跟账号无关，直接抛
           if (!isAccountScopedFailure(err)) throw err;
-
           // 账号级失败：先停用当前号，再在同一个请求里换号重试。
           // 不能把失败抛回客户端等它重发——那样下一次轮询又会先撞回这个坏号。
           // 但如果这一轮已经把部分正文/思考流给客户端了，就不能换号重放（会重复），只能抛。
@@ -240,6 +263,9 @@ export class DirectEngine {
             throw new RateLimitError(err.message, { retryAfterMs: Math.max(1000, retryAfterMs) });
           }
           throw err;
+          }
+        } finally {
+          this.pool.release(account);
         }
       }
       throw new RateLimitError('暂时没有可用账号');
@@ -517,10 +543,21 @@ export class DirectEngine {
     return ids;
   }
 
+  /**
+   * 选一个账号做文件上传。
+   *
+   * 注意：这里**不占用** inflight 名额 —— 上传是一次短请求，用 pick() 拿号却不
+   * release 会让该账号的 inflight 只增不减，配了 MAX_INFLIGHT_PER_ACCOUNT 时
+   * 几个文件传完就把账号永久锁死。所以直接轮询可用账号，不动 inflight/requests 计数。
+   */
   #uploadAccount() {
-    const account = this.pool.pick() || this.pool.accounts[0];
-    if (!account) throw new AuthExpiredError();
-    return account;
+    const now = Date.now();
+    for (let i = 0; i < this.pool.accounts.length; i += 1) {
+      const account = this.pool.accounts[i];
+      if (account.cooldownUntil <= now && !account.authFailed) return account;
+    }
+    if (!this.pool.accounts.length) throw new AuthExpiredError();
+    return this.pool.accounts[0];
   }
 
   async #uploadFile(account, file) {
@@ -655,22 +692,42 @@ export class DirectEngine {
     return (await this.#solveNew(account)).header;
   }
 
-  /** 取走预解的 PoW；没有预解就现场解一个（两者都返回 { header, expireAt }）。 */
-  #takePow(account) {
-    if (account.powNext) {
-      const pending = account.powNext;
-      account.powNext = null;
-      return pending;
+  /** 取走一个预解的 PoW；没有预解就共享进行中的求解，实在没有再现场解一个。 */
+  async #takePow(account) {
+    const pooled = account.powPool.shift();
+    if (pooled) {
+      // 取走的同时补上下一发，避免并发请求到达时池子被抢空、退化成现场求解
+      this.#prefetchPow(account);
+      return pooled;
+    }
+    // 有共享的进行中求解就等它（并发请求不该各自重解一次）
+    if (account.powPending) {
+      try {
+        const solved = await account.powPending;
+        this.#prefetchPow(account);
+        return solved;
+      } catch {
+        // 共享求解失败，落到下面自己解
+      }
     }
     return this.#solveNew(account);
   }
 
   #prefetchPow(account) {
-    if (this.closed || account.powNext) return;
-    account.powNext = this.#solveNew(account);
-    account.powNext.catch(() => {
-      account.powNext = null;
-    });
+    if (this.closed) return;
+    // 池子满了就别再解（每个 PoW 都有 expire_at，解太多会白白过期）
+    if (account.powPool.length >= POW_POOL_SIZE || account.powPending) return;
+    const pending = this.#solveNew(account);
+    account.powPending = pending;
+    pending
+      .then((solved) => {
+        if (this.closed) return;
+        if (account.powPool.length < POW_POOL_SIZE) account.powPool.push(solved);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (account.powPending === pending) account.powPending = null;
+      });
   }
 
   async #powHeaderFor(account, targetPath) {

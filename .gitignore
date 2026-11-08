@@ -8,3 +8,10 @@ data/
 test/.artifacts/
 bin/
 .DS_Store
+
+# Windows 打包产物（约 300MB，绝不入库；用 npm run exe 本地生成）
+dist/
+.build-exe/
+
+# Docker 构建上下文外的临时文件
+*.tar

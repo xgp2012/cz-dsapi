@@ -411,6 +411,54 @@ table.data tr:hover td {
   min-width: 0;
 }
 
+/* ---------------- 首次配置引导 ---------------- */
+
+.setup-steps {
+  margin: 0;
+  padding-left: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  line-height: 1.7;
+}
+
+.setup-steps li {
+  padding-left: 4px;
+}
+
+.setup-code {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.06);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  user-select: all;
+  word-break: break-all;
+}
+
+kbd {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  background: rgba(0, 0, 0, 0.04);
+  font-family: inherit;
+  font-size: 0.92em;
+  line-height: 1.5;
+}
+
+@media (prefers-color-scheme: dark) {
+  .setup-code {
+    background: rgba(255, 255, 255, 0.09);
+  }
+
+  kbd {
+    border-color: rgba(255, 255, 255, 0.22);
+    background: rgba(255, 255, 255, 0.08);
+  }
+}
+
 mdui-text-field,
 mdui-select {
   width: 100%;

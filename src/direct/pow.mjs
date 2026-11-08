@@ -9,12 +9,20 @@ import readline from 'node:readline';
  * Go 实测 ~20-30ms，Node 里跑同样逻辑要慢一个数量级。
  */
 export class PowSolver {
-  constructor({ bin, logger }) {
+  constructor({ bin, logger, env }) {
     this.bin = bin;
     this.log = logger;
     this.proc = null;
     this.pending = new Map();
     this.seq = 0;
+    /**
+     * 子进程环境。必须显式传：
+     * config.mjs 的 loadDotEnv 是在 import 期把 .env 写进 process.env 的，
+     * 而子进程继承的是**父进程环境**——如果 PowSolver 早于 config 构造，
+     * 或者 .env 的值是通过别的路径注入的，子进程就看不到 POW_WORKERS。
+     * 显式传一份拷贝，行为才可预测、可测试。
+     */
+    this.env = env && typeof env === 'object' ? env : process.env;
   }
 
   #ensureProcess() {
@@ -26,7 +34,7 @@ export class PowSolver {
       );
     }
 
-    this.proc = spawn(this.bin, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+    this.proc = spawn(this.bin, [], { stdio: ['pipe', 'pipe', 'pipe'], env: this.env });
     this.proc.on('exit', (code) => {
       this.log?.warn(`PoW 求解器退出（code ${code}）`);
       this.proc = null;

@@ -200,9 +200,16 @@ test('空 messages 报错', () => {
 });
 
 test('协议声明：教原生 DSML 输出格式，不要求 DO', () => {
-  assert.ok(SPECIAL_TOKENS_HEADER.includes('<｜DSML｜ calls>'));
-  assert.ok(SPECIAL_TOKENS_HEADER.includes('invoke name='));
-  assert.ok(SPECIAL_TOKENS_HEADER.includes('parameter name='));
+  // DSML 是模型原生语法（见 src/prompt/dsml.mjs 头注释里的样例），提示词只负责
+  // 声明"用原生 DSML、别换成散文/JSON/围栏"，不再内嵌一份可抄的标签样板
+  // （样板会让模型把标签当正文模仿，且每个字符都要计入 prompt 预算）。
+  assert.ok(SPECIAL_TOKENS_HEADER.includes('native tool-calling format, DSML'));
+  assert.ok(
+    SPECIAL_TOKENS_HEADER.includes(
+      'Do not replace the required format with ordinary prose, JSON, XML, Markdown code fences',
+    ),
+  );
+  assert.ok(!/<[ \t]*[｜|][ \t]*DSML/i.test(SPECIAL_TOKENS_HEADER), '提示词里不该内嵌 DSML 标签样板');
   assert.ok(!SPECIAL_TOKENS_HEADER.includes('DO:{"name"'));
   assert.ok(!SPECIAL_TOKENS_HEADER.includes('封禁'));
 });

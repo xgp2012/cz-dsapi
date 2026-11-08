@@ -65,7 +65,7 @@ const STATIC_MIME = {
 
 const MAX_TOKENS_PER_REQUEST = 32;
 
-export function createAdminHandler({ config, logger, web }) {
+export function createAdminHandler({ config, logger, web, server }) {
   const log = logger.child('admin');
   const rootDir = config.rootDir;
   const distDir = path.join(rootDir, 'web', 'dist');
@@ -157,7 +157,7 @@ export function createAdminHandler({ config, logger, web }) {
   function buildOverview() {
     const status = web.status();
     const saved = loadTokens(config);
-    const models = modelsResponse().data.map((m) => m.id);
+    const models = modelsResponse(config).data.map((m) => m.id);
     return {
       ok: true,
       pid: process.pid,
@@ -465,9 +465,36 @@ export function createAdminHandler({ config, logger, web }) {
     return { file: serverLog, exists: true, lines: tail, size: text.length };
   }
 
+  /**
+   * 重启服务。
+   *
+   * 两种运行形态必须分开处理 —— 它们连"去哪里找启动入口"都不一样：
+   *
+   *   源码运行：交给 scripts/server-ctl.mjs（down→up，带 pid 文件、pgrep 兜底、
+   *             pm2/systemd 检测）。这些工具都是 Unix 风格的，且 process.execPath
+   *             是 node，可以带脚本参数。
+   *
+   *   打包 exe：process.execPath 是 fuckds.exe，**不接受脚本参数**，也没有 pgrep/ps，
+   *             SIGTERM 在 Windows 上也不可靠。所以自己实现：detached 拉起一个新的
+   *             exe（继承环境变量，cwd 设为项目根），等它起来后再退出本进程。
+   *             顺序很重要 —— 先起新的会撞端口，先退旧的会丢请求；
+   *             这里用"新进程先等旧进程让出端口"的方式：spawn 前先 close server，
+   *             让端口立刻空出来，再启动。
+   */
   async function restartServer() {
+    const packaged = Boolean(process.env.FUCKDS_ROOT) || !/node(\.exe)?$/i.test(path.basename(process.execPath));
+
+    if (packaged) {
+      return restartPackaged();
+    }
+
     if (!fs.existsSync(ctlScript)) {
-      throw new ApiError(500, `找不到重启脚本：${ctlScript}`);
+      throw new ApiError(
+        500,
+        `找不到重启脚本：${ctlScript}\n` +
+          '如果你是从源码运行，请确认 scripts/server-ctl.mjs 存在；' +
+          '如果是打包版，这个文件不需要（会直接重启可执行文件）。',
+      );
     }
     const child = spawn(process.execPath, [ctlScript, 'restart'], {
       cwd: rootDir,
@@ -482,6 +509,61 @@ export function createAdminHandler({ config, logger, web }) {
       message: '正在重启服务，页面会自动重连…',
       pid: child.pid,
     };
+  }
+
+  /**
+   * 打包版重启：直接把自己重新拉起来。
+   *
+   * 步骤：
+   *   1. detached 启动同一个 exe，cwd/rootDir 不变，环境变量原样继承；
+   *   2. 关掉自己的 HTTP server 释放端口，然后走优雅退出。
+   *
+   * 注意 exe 是 Node SEA 打的包，"可执行文件 + 无参数"就是完整的启动命令，
+   * 不需要（也不能）传 src/index.mjs —— 传了会被 SEA 当成用户参数。
+   */
+  async function restartPackaged() {
+    const exe = process.execPath;
+
+    log.info('收到后台重启请求（打包版），将直接重启可执行文件', { exe });
+
+    // 延迟动作，让 sendJson 先把响应 flush 回浏览器
+    setTimeout(() => {
+      let child;
+      try {
+        child = spawn(exe, [], {
+          cwd: rootDir,
+          detached: true,
+          stdio: 'ignore',
+          env: process.env,
+          windowsHide: true,
+        });
+      } catch (err) {
+        log.error('重启失败：无法启动新进程', err.message);
+        process.exit(1);
+        return;
+      }
+
+      child.on('error', (err) => {
+        log.error('重启失败：新进程启动出错', err.message);
+        process.exit(1);
+      });
+      child.unref();
+      log.info('新进程已启动，当前进程即将退出', { pid: child.pid });
+
+      // 新进程启动后会短暂遇到 EADDRINUSE（旧端口还没释放），所以先 close 再退。
+      // 退出走 SIGTERM 那套优雅关闭，好让 index.mjs 关掉浏览器和子进程 ——
+      // 直接 process.exit() 会把 Playwright 的 Chromium 变成孤儿进程堆在后台。
+      setTimeout(() => {
+        try {
+          server?.close?.();
+        } catch {
+          /* 已经关了 */
+        }
+        setTimeout(() => process.kill(process.pid, 'SIGTERM'), 150);
+      }, 150);
+    }, 120);
+
+    return { ok: true, message: '正在重启服务，页面会自动重连…', pid: null };
   }
 
   /* ------------------------------------------------------------------ *

@@ -7,6 +7,25 @@ import { SPECIAL_TOKENS_HEADER } from '../src/prompt/special.mjs';
 
 const long = (tag, n) => `${tag}：${'x'.repeat(n)}`;
 
+/**
+ * "紧预算"上限：必须比正文骨架（协议提示词 + reserve + note）大。
+ *
+ * 历史上这里硬编码 6000，而 SPECIAL_TOKENS_HEADER 曾从 2189 字符扩写到 4749，
+ * 骨架涨到约 6322 之后 6000 就成了"连空对话都放不下"的值，两个用例因此必红
+ * （见 docs/DEVELOPMENT.md §14.3）。改成从提示词实际长度推导，
+ * 提示词再变长时这里自动跟着走，不会再出现一次莫名其妙的漂移。
+ */
+const PROTOCOL_BLOCK_CHARS = SPECIAL_TOKENS_HEADER.trim().length + 13; // '\n## System:\n' + 头尾
+const TIGHT_BUDGET = PROTOCOL_BLOCK_CHARS + 1024 /* reserve */ + 525 /* note */ + 1500 /* minDialog */ + 200;
+
+/** 断言预算确实比正文骨架宽裕，否则下面的用例测的就不是"拆分"而是"必错" */
+function assertBudgetIsWorkable() {
+  assert.ok(
+    TIGHT_BUDGET > PROTOCOL_BLOCK_CHARS + 1024 + 525,
+    `紧预算 ${TIGHT_BUDGET} 连协议提示词骨架都放不下（骨架约 ${PROTOCOL_BLOCK_CHARS}）`,
+  );
+}
+
 function multiTurnPrompt(turns = 6, size = 2000) {
   const messages = [];
   for (let i = 0; i < turns; i += 1) {
@@ -56,10 +75,11 @@ test('超限：客户端 system 过大时移进附件，协议提示词和最新
     tools: [{ type: 'function', function: { name: 'exec_shell' } }],
   });
 
-  const plan = planOverflow(prompt, { maxChars: 6000 });
+  assertBudgetIsWorkable();
+  const plan = planOverflow(prompt, { maxChars: TIGHT_BUDGET });
   const text = plan.attachment.buffer.toString('utf8');
 
-  assert.ok(plan.prompt.length <= 6000, `正文超限: ${plan.prompt.length}`);
+  assert.ok(plan.prompt.length <= TIGHT_BUDGET, `正文超限: ${plan.prompt.length} > ${TIGHT_BUDGET}`);
   assert.ok(plan.prompt.includes(SPECIAL_TOKENS_HEADER.trim()), '协议提示词必须留在正文');
   assert.match(plan.prompt, /## CONTEXT_ATTACHMENT:/);
   assert.match(plan.prompt, /## User:\n你好/);
@@ -81,10 +101,11 @@ test('超限：工具声明过大时也能移进附件', () => {
     tools: [bigSchema],
   });
 
-  const plan = planOverflow(prompt, { maxChars: 6000 });
+  assertBudgetIsWorkable();
+  const plan = planOverflow(prompt, { maxChars: TIGHT_BUDGET });
   const text = plan.attachment.buffer.toString('utf8');
 
-  assert.ok(plan.prompt.length <= 6000, `正文超限: ${plan.prompt.length}`);
+  assert.ok(plan.prompt.length <= TIGHT_BUDGET, `正文超限: ${plan.prompt.length} > ${TIGHT_BUDGET}`);
   assert.ok(plan.prompt.includes(SPECIAL_TOKENS_HEADER.trim()));
   assert.match(plan.prompt, /## CONTEXT_ATTACHMENT:/);
   assert.ok(!plan.prompt.includes('BIGTOOLS'), '工具声明应该进附件');

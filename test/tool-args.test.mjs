@@ -28,15 +28,24 @@ const TOOLS = [
 
 const schemas = getToolSchemas(TOOLS);
 
-test('prompt is English and forbids omitting the string attribute', () => {
+test('prompt is English and forbids omitting required parameters', () => {
   assert.ok(!/[\u4e00-\u9fff]/.test(SPECIAL_TOKENS_HEADER), 'system prompt must not contain Chinese');
-  assert.ok(SPECIAL_TOKENS_HEADER.includes('NEVER omit'));
-  assert.ok(SPECIAL_TOKENS_HEADER.includes('string="false"'));
+  assert.ok(
+    SPECIAL_TOKENS_HEADER.includes(
+      'Include all required parameters. Omit unknown optional parameters.',
+    ),
+  );
+  // 非字符串参数必须能表达类型：DSML 的 string 属性缺省 = 字符串，
+  // string="false" 才走 JSON 解码（见 src/prompt/dsml.mjs#decodeParameter）。
+  assert.ok(
+    SPECIAL_TOKENS_HEADER.includes('Integers and numbers must be passed as JSON numbers'),
+    '提示词必须约束非字符串参数的类型',
+  );
   const { prompt } = buildPrompt({
     messages: [{ role: 'user', content: 'hi' }],
     tools: TOOLS,
   });
-  assert.ok(prompt.includes('NEVER omit'));
+  assert.ok(prompt.includes('Include all required parameters. Omit unknown optional parameters.'));
   // required is surfaced at the top level of the declaration, not only nested
   const decl = JSON.parse(renderToolDeclarations(TOOLS)[0]);
   assert.deepEqual(decl.required, ['query']);

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import { POW_EXPIRY_SAFETY_MS, powNotExpired } from '../src/direct/client.mjs';
 import { PowSolver } from '../src/direct/pow.mjs';
+import { resolveExecutable } from '../src/util.mjs';
 
 /** 只关注 PoW 缓存过期判定与 ds-pow 协议，不依赖网络 / 账号。 */
 
@@ -41,7 +42,8 @@ test('powNotExpired：服务端没给 expire_at 时保守认为可用（与旧�
 
 test('PowSolver 能对已知 challenge 解出正确答案（ds-pow 协议回归）', async (t) => {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-  const bin = process.env.POW_BIN || path.join(root, 'bin', 'ds-pow');
+  // Windows 上产物可能是 bin/ds-pow 或 bin/ds-pow.exe，统一交给 resolveExecutable
+  const bin = resolveExecutable(process.env.POW_BIN || path.join(root, 'bin', 'ds-pow'));
   if (!fs.existsSync(bin)) {
     t.skip(`缺少 ${bin}，先运行 npm run pow:build`);
     return;

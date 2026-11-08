@@ -6,11 +6,34 @@ export const MODELS = [
   { id: 'deepseek-v4.1-flash-1017', object: 'model', created: 0, owned_by: 'deepseek-web' },
 ];
 
-export const newCompletionId = () => `chatcmpl-${crypto.randomBytes(12).toString('hex')}`;
+/**
+ * 可发现的模型列表 = 默认模型 + 所有别名 + 历史标签，默认模型排第一。
+ *
+ * 为什么不能直接返回 `MODELS`：`defaultModel`（默认 deepseek-flash）与 `modelAliases`
+ * 都会真实改变行为，但原来没进列表，导致
+ *   - `GET /v1/models` 里看不到客户端 / 落地页 / 控制台实际在用的 `deepseek-flash`；
+ *   - `GET /v1/models/deepseek-flash` 直接 404，而 `POST /v1/chat/completions` 带同一个
+ *     model 却能正常工作 —— "列得出 ≠ 用得了"，这是曾经的真实不一致。
+ * `DEFAULT_MODEL` 可以在后台改，列表也必须跟着变，所以这里接收 config。
+ */
+export function modelsResponse(config) {
+  const deepseek = config?.deepseek ?? {};
+  const ids = [
+    deepseek.defaultModel,
+    ...Object.keys(deepseek.modelAliases ?? {}),
+    ...MODELS.map((m) => m.id),
+  ]
+    .map((id) => (typeof id === 'string' ? id.trim() : ''))
+    .filter(Boolean);
 
-export function modelsResponse() {
-  return { object: 'list', data: MODELS };
+  const data = [...new Set(ids)].map(
+    (id) =>
+      MODELS.find((m) => m.id === id) ?? { id, object: 'model', created: 0, owned_by: 'deepseek-web' },
+  );
+  return { object: 'list', data };
 }
+
+export const newCompletionId = () => `chatcmpl-${crypto.randomBytes(12).toString('hex')}`;
 
 /** 非流式响应 */
 export function buildChatCompletion({ id, model, content, reasoning, toolCalls, finishReason, usage }) {

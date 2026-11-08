@@ -14,6 +14,19 @@ import { canonicalArguments, readJsonObject } from '../prompt/tools.mjs';
  * 两种形态都区分大小写、半角/全角冒号。
  */
 
+/**
+ * 协议探测的尾部窗口长度（字符）。
+ *
+ * 流式过滤只需要看缓冲的尾部：一个**正在成形**的协议块，其起点距离缓冲尾部
+ * 不会超过 holdBack（默认 48）+ 最长半截标记长度（原生工具 token `<|...tool...|>`
+ * 限 64+64，段标题最长约 26）。取 512 有充分余量。
+ *
+ * 这个窗口是性能关键：所有扫描（findDsmlStart / findSectionStart /
+ * pendingProtocolStart / #findCut 的快路径）都只在这个窗口里做，
+ * 每帧成本因此与输出总长度无关。窗口之内仍走完整逻辑，正确性不变。
+ */
+const PROTOCOL_LOOKAHEAD = 512;
+
 /** 行首允许出现的「装饰符」，最多 24 个：`> `、`- `、`### `、`**`、反引号、序号 `1. ` 等 */
 const LINE_LABEL = /^[^\p{L}\p{N}]{0,24}(DO|RESULT)[ \t]*[*_`~]{0,4}[ \t]*[:：=][ \t]*[*_`~]{0,4}/iu;
 /** 行内形态：标签后面紧跟 JSON 对象才算协议，避免误伤正常行文 */
@@ -424,16 +437,46 @@ function isFabricatedBlock(block) {
 /** 流式：提前找到伪造段标题的位置（完整行才算） */
 function findSectionStart(text, from = 0) {
   if (!text) return -1;
+  // 6 个带 /m 的正则，在几百 KB 的 buffer 上每个 push 跑一遍是 O(n)/帧。
+  // 段标题极短（最长约 26 字符），且只可能出现在尾部窗口内 —— 更早的位置
+  // 要么早已发出，要么已被 pending 逻辑扣住 emitted。
+  const start = Math.max(0, from, text.length - PROTOCOL_LOOKAHEAD);
+  if (start >= text.length) return -1;
+  const window = start > 0 ? text.slice(start) : text;
   let best = -1;
   for (const pattern of SECTION_PATTERNS) {
-    pattern.lastIndex = Math.max(0, from);
-    const match = pattern.exec(text);
+    pattern.lastIndex = 0;
+    const match = pattern.exec(window);
     if (match && (best === -1 || match.index < best)) best = match.index;
   }
-  return best;
+  return best >= 0 ? start + best : -1;
 }
 
 /** 段落标题的「可能前缀」：整行还没写完时先扣住，避免半截标题漏进正文 */
+/**
+
+/**
+ * 压缩缓冲时，在"安全丢弃边界"之前额外保留的字符数。
+ * 只影响内存占用（长回答最多多留这么点），不影响任何判断结果。
+ */
+const KEEP_BEHIND = 256;
+
+/**
+ * 触发缓冲压缩的最小可丢弃长度。
+ * 太小会让压缩过于频繁（每次都要复制一遍 buffer），太大则白占内存。
+ * 4KB 让压缩摊薄到"每 4KB 输出复制一次"，整体仍是 O(n)。
+ */
+const COMPACT_MIN_DROP = 4096;
+
+/**
+ * 快路径触发词：只有出现这些**协议形态**才可能新出现协议块。
+ *
+ * 不能用裸词 `DO` —— 它会匹配英文 "window" / "download" / 任意 "do"，
+ * 让快路径几乎从不命中，干净英文长文本退化到 O(n²)。
+ * 这里要求 DO/RESULT 后面紧跟 `:` / `：` / `=` 或装饰符，或者出现 `<`、`##`、段标题。
+ */
+const PROTOCOL_HINT = /[<#]|(?:DO|RESULT)[ \t*_`~]{0,4}[:：=]/i;
+
 const SECTION_PHRASES = [
   'SYSTEM',
   'USER',
@@ -477,35 +520,49 @@ function pendingProtocolStart(text, from) {
   // 从 start（已发出位置）开始扫即可：一个正在成形的标签若起点在
   // start 之前，上一次 push 时 pending 逻辑就已经把 emitted 扣在
   // 它的起点，不可能越过它；越过的标签已经发出，扣也来不及了。
-  LABEL_TOKEN.lastIndex = start;
+  //
+  // 但只用 start 还不够：start 与文本尾部的距离随输出增长（emitted 每帧只前进
+  // holdBack 左右，buffer 却越来越长），且每命中一次就 text.slice(match.index)
+  // 复制一份剩余全文 —— 干净英文长文本因此仍是 O(n²)。
+  // 一个"正在成形"的标签起点必然落在尾部 PROTOCOL_LOOKAHEAD 窗口内，
+  // 所以扫描起点取 start 与窗口起点的较大者。
+  const scanStart = Math.max(start, text.length - PROTOCOL_LOOKAHEAD);
+  const window = text.slice(scanStart);
+
+  LABEL_TOKEN.lastIndex = 0;
   let match;
-  while ((match = LABEL_TOKEN.exec(text)) !== null) {
-    if (PENDING_LABEL_TAIL.test(text.slice(match.index))) candidates.push(match.index);
+  while ((match = LABEL_TOKEN.exec(window)) !== null) {
+    // 在窗口内取后缀即可，不必切整个 text
+    if (PENDING_LABEL_TAIL.test(window.slice(match.index))) candidates.push(scanStart + match.index);
   }
 
-  // 原生 token 只可能在尾部：从 start 往后找最后一个 '<'，不要全文 lastIndexOf。
-  const suffixForLt = text.slice(start);
+  // 原生 token 只可能在尾部：从 scanStart 往后找最后一个 '<'，不要全文 lastIndexOf。
+  const suffixForLt = window;
   const ltInSuffix = suffixForLt.lastIndexOf('<');
-  const lt = ltInSuffix >= 0 ? start + ltInSuffix : -1;
-  if (lt >= start && PENDING_NATIVE_TOKEN.test(text.slice(lt))) candidates.push(lt);
+  const lt = ltInSuffix >= 0 ? scanStart + ltInSuffix : -1;
+  if (lt >= scanStart && PENDING_NATIVE_TOKEN.test(text.slice(lt))) candidates.push(lt);
 
   // 最后一行：只在未发出部分里有换行时才需要检查。原来用全文
   // lastIndexOf('\n')，全文没有换行时每个 push 都要扫一遍全文。
   // 未发出部分里没有换行，说明最后一行起点在 start 之前，不可能是
   // 新出现的段标题行，直接跳过。
   const nlInSuffix = suffixForLt.lastIndexOf('\n');
-  const lineStart = nlInSuffix >= 0 ? start + nlInSuffix + 1 : -1;
-  if (lineStart >= start) {
-    const line = text.slice(lineStart);
+  const lineStart = nlInSuffix >= 0 ? scanStart + nlInSuffix + 1 : -1;
+  if (lineStart >= 0) {
+    // 同样只在窗口内取这一行：lineStart 可能远早于 scanStart（整段没有换行时
+    // 就是 0），直接 text.slice(lineStart) 会把整个剩余缓冲复制一遍。
+    const line = text.slice(Math.max(lineStart, scanStart));
     // 只有 markdown 标题行（# / ## …）才可能是协议段标题，
     // 否则正文里以 "System: ..." 开头的普通句子会被整行扣住不发。
     const isHeading = /^[ \t]{0,3}#{1,4}[ \t]*\S/.test(line);
-    const stripped = line
-      .replace(/^[ \t]{0,3}(?:#{1,4}[ \t]*)?/, '')
-      .replace(/[*_`~ \t]+/g, '');
-    const upper = stripped.toUpperCase();
-    const isPhrase = !upper || SECTION_PHRASES.some((phrase) => phrase.startsWith(upper) || upper.startsWith(phrase));
-    if (isPhrase && (isHeading || !upper)) candidates.push(lineStart);
+    // 段标题本身很短，超过这个长度的一定不是标题，省掉 replace 的全文扫描
+    const stripped = line.length <= 96 ? line.replace(/^[ \t]{0,3}(?:#{1,4}[ \t]*)?/, '').replace(/[*_`~ \t]+/g, '') : null;
+    if (stripped !== null) {
+      const upper = stripped.toUpperCase();
+      const isPhrase =
+        !upper || SECTION_PHRASES.some((phrase) => phrase.startsWith(upper) || upper.startsWith(phrase));
+      if (isPhrase && (isHeading || !upper)) candidates.push(lineStart);
+    }
   }
 
   return candidates.length ? Math.min(...candidates) : -1;
@@ -536,17 +593,46 @@ export class ToolMarkupStreamFilter {
 
     let limit = this.cutIndex >= 0 ? this.cutIndex : Math.max(0, this.buffer.length - this.holdBack);
     if (this.cutIndex < 0) {
+      // 协议块只可能从尾部窗口开始：早期 push 里改用的这三个扫描，
+      // 起点统一收敛到尾部窗口，避免每帧 O(buffer) 扫描。
+      const scanFrom = this.#scanFrom();
       // 半截 DSML 标签也先扣在手里
-      const dsml = findDsmlStart(this.buffer, this.emitted);
+      const dsml = findDsmlStart(this.buffer, scanFrom);
       if (dsml) limit = Math.min(limit, dsml.index);
       // 半截 DO:/RESULT:、半截段落标题、半截原生工具 token：同样不能先发出去
-      const pending = pendingProtocolStart(this.buffer, this.emitted);
+      const pending = pendingProtocolStart(this.buffer, scanFrom);
       if (pending >= 0) limit = Math.min(limit, pending);
       // 半截 <|END 也不能先发（完整 <|END|> 由 findToolMarkup 整块剔除）
-      const pendingEnd = findPendingEndToken(this.buffer, this.emitted);
+      const pendingEnd = findPendingEndToken(this.buffer, scanFrom);
       if (pendingEnd >= 0) limit = Math.min(limit, pendingEnd);
     }
-    return this.#slice(limit);
+    const out = this.#slice(limit);
+    this.#compact();
+    return out;
+  }
+
+  /**
+   * 把已经不可能再被用到的前缀丢掉，并同步修正下标。
+   *
+   * 这是 O(n²) 的最后一块：`buffer` 只增不减，`push` 每帧做一次
+   * `buffer += text`（V8 的 rope 在跨阈值后会复制整个串），而且所有
+   * slice 也都要按已增长的长度算。
+   *
+   * 什么时候可以丢：`emitted` 之前的字符已经发出去了，`cutIndex` 若已确定
+   * 则它之后的内容由 cutIndex 截断——两者取 min 就是"永远不会再影响结果"的边界。
+   * 保留一个 KEEP_BEHIND 的安全余量（窗口 + holdBack），保证窗口内的判断不受影响。
+   */
+  #compact() {
+    const safe = Math.min(this.emitted, this.cutIndex >= 0 ? this.cutIndex : Infinity);
+    if (!Number.isFinite(safe)) return;
+    const drop = safe - KEEP_BEHIND - PROTOCOL_LOOKAHEAD;
+    // 只在积攒了足够多垃圾时才压缩：压缩本身要复制一次 buffer，
+    // 太频繁就变成"每帧复制一遍"，反而又回到 O(n²)。
+    if (drop <= COMPACT_MIN_DROP) return;
+
+    this.buffer = this.buffer.slice(drop);
+    this.emitted = Math.max(0, this.emitted - drop);
+    if (this.cutIndex >= 0) this.cutIndex = Math.max(0, this.cutIndex - drop);
   }
 
   /** 更新「截断点」：找到第一个协议块（工具调用 / RESULT / 伪造段标题）就停在那之前。 */
@@ -570,18 +656,25 @@ export class ToolMarkupStreamFilter {
     const candidates = [];
     // 原来每个 push 都对整个已累积 buffer 做一次全文正则扫描：
     // 输出越长，每帧成本越高，同样是 O(总长度) 的二次开销。
-    // 快路径：长文本下，先看已发出位置附近 128 字符 + 未发出部分里
-    // 有没有协议触发词（'<'、RESULT/DO、##、段标题）。没有，说明本帧
-    // 不可能新出现一个协议块 —— 已发出的部分早已被扫描过，而一个
-    // 正在成形的块（DSML 标签、DO:/RESULT:、段标题）一定会被 pending
-    // 逻辑扣住 emitted，使其起点落在检查范围内。没有触发词就直接
-    // 跳过全文扫描；有触发词时仍走全文扫描，正确性不受影响。
+    // 快路径：长文本下，先看已发出位置附近 + 未发出部分里有没有协议触发词
+    // （'<'、RESULT/DO、##、段标题）。没有，说明本帧不可能新出现一个协议块 ——
+    // 已发出的部分早已被扫描过，而一个正在成形的块（DSML 标签、DO:/RESULT:、
+    // 段标题）一定会被 pending 逻辑扣住 emitted，使其起点落在检查范围内。
+    //
+    // 关键修正 1：`DO` 原来是裸词，会匹配任意英文 "do"（window / download / do it），
+    // 导致快路径几乎从不命中，干净英文长文本退化成 O(n²)（实测 200KB 要 64 秒）。
+    // 这里把触发词收紧成「协议形态」：DO/RESULT 后必须紧跟 `:` 或空白，
+    // 而不是把整个词干当信号。
+    // 关键修正 2：从 `emitted - 128` 开始扫是错的 —— emitted 每帧只前进一点点，
+    // 而 buffer 在增长，所以扫描区间随输出长度线性增长。真正的跨帧风险窗口是
+    // **尾部 holdBack + 一个半截标记的长度**，所以只需扫缓冲尾部固定长度。
     if (this.buffer.length >= 4096) {
-      const tail = this.buffer.slice(Math.max(0, this.emitted - 128));
-      if (!/[<]|RESULT|DO|##|_ROLE_MESSAGES|TOOL_FUNCTIONS/i.test(tail)) return null;
+      const windowStart = Math.max(0, this.buffer.length - PROTOCOL_LOOKAHEAD);
+      const tail = this.buffer.slice(windowStart);
+      if (!PROTOCOL_HINT.test(tail)) return null;
     }
     // 已发出的部分不可能再出现新协议块（真有块，早已被截断或扣住），
-    // 所以长文本下只扫描“已发出位置所在行的行首”之后的部分：
+    // 所以长文本下只扫描"已发出位置所在行的行首"之后的部分：
     // 行首之前的内容都已发出，且行内协议块的起点一定不早于该行首
     // （否则它早已被 pending 逻辑扣住，emitted 不会越过它）。
     // 短文本（<4KB）仍走全文扫描，保持与旧行为逐字一致。
@@ -593,14 +686,32 @@ export class ToolMarkupStreamFilter {
     if (blocks.length) {
       candidates.push({ index: searchFrom + blocks[0].start, kind: blocks[0].kind });
     }
-    const dsml = findDsmlStart(this.buffer, this.emitted);
+    // 关键修正 3：这两个扫描原来都从 `emitted` 开始扫到 buffer 尾，成本同样随长度
+    // 线性增长。协议块只可能从缓冲尾部附近开始（更早的位置早已被发出或截断），
+    // 所以只在尾部窗口里找。
+    const scanFrom = this.#scanFrom();
+    const dsml = findDsmlStart(this.buffer, scanFrom);
     // 只有标签已经完整时才永久截断；半截标签由 holdBack 兜住
     if (dsml?.complete) candidates.push({ index: dsml.index, kind: 'TOOL_CALL' });
-    const section = findSectionStart(this.buffer, this.emitted);
+    const section = findSectionStart(this.buffer, scanFrom);
     if (section >= 0) candidates.push({ index: section, kind: 'SECTION' });
     if (!candidates.length) return null;
     const first = candidates.reduce((a, b) => (b.index < a.index ? b : a));
     return { index: first.index, kind: first.kind };
+  }
+
+  /**
+   * 协议块扫描的起点。
+   *
+   * 一个协议块要能"新出现"，它的起点必须在**尚未最终确定的区域**里：
+   * 即 `emitted` 之后、且落在 holdBack 扣留区之前的尾部窗口内。
+   * 取 `min(emitted, buffer.length - PROTOCOL_LOOKAHEAD)` 保证：
+   * - 短文本：退化成从 0 全扫（与旧行为一致，测试覆盖的就是这一档）；
+   * - 长文本：只扫尾部固定长度，成本恒定，不再是 O(n)/帧。
+   */
+  #scanFrom() {
+    if (this.buffer.length < 4096) return 0;
+    return Math.max(0, Math.min(this.emitted, this.buffer.length - PROTOCOL_LOOKAHEAD));
   }
 
   #slice(limit) {

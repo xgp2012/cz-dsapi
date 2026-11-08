@@ -2,9 +2,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
-import { parseEnvText } from './util.mjs';
+import { parseEnvText, resolveExecutable } from './util.mjs';
 
-const ROOT = path.resolve(import.meta.dirname, '..');
+/**
+ * 项目根目录。
+ *
+ * 默认按源码位置推导（src/ 的上一级）。但 SEA 打包成 exe 后，`import.meta.dirname`
+ * 不再是一个真实可用的目录（入口是内嵌的），所以打包入口会预先设置 FUCKDS_ROOT
+ * 为 exe 所在目录。这样 exe 与 src/ 同级放置时，.env / data / bin / web 都能照常找到。
+ */
+const ROOT = process.env.FUCKDS_ROOT
+  ? path.resolve(process.env.FUCKDS_ROOT)
+  : path.resolve(import.meta.dirname, '..');
 
 /* ------------------------------------------------------------------ *
  * 极简 .env 加载（不引入 dotenv，减少依赖）
@@ -29,6 +38,11 @@ const int = (value, fallback) => {
 };
 
 const str = (value, fallback = '') => (value === undefined || value === null ? fallback : String(value).trim());
+
+const float = (value, fallback) => {
+  const n = Number.parseFloat(value ?? '');
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
 
 const expandHome = (p) => (p && p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p);
 
@@ -84,10 +98,32 @@ export function loadConfig(env = process.env) {
       port: int(env.PORT, 8787),
       apiKey: str(env.API_KEY),
       cors: str(env.CORS_ORIGIN, '*'),
+      // 入口限流（按客户端 IP 的令牌桶）。和号池冷却不同：那个是上游拒了才冷却，
+      // 这个是流量还没打到上游就先挡掉，防止 HOST=0.0.0.0 + 空 API_KEY 时被白嫖。
+      rateLimit: {
+        enabled: bool(env.RATE_LIMIT_ENABLED, true),
+        // 每分钟允许的突发请求数
+        capacity: int(env.RATE_LIMIT_PER_MINUTE, 60),
+        // 稳态补充速率（每秒补几个令牌）
+        refillPerSec: float(env.RATE_LIMIT_REFILL_PER_SEC, 1),
+        maxBuckets: int(env.RATE_LIMIT_MAX_BUCKETS, 10_000),
+      },
+      // 反向代理场景：不设就只认 socket 地址（客户端伪造 XFF 无效）
+      // loopback: 只有直连方是本地/私网时才信任 X-Forwarded-For
+      trustProxy: str(env.TRUST_PROXY, ''),
     },
     engine: str(env.ENGINE, 'direct'),
     direct: {
-      powBin: path.resolve(ROOT, expandHome(str(env.POW_BIN, 'bin/ds-pow'))),
+      // Windows 上 go build -o bin/ds-pow 不产出 .exe，Node 的 spawn 又不会补扩展名，
+      // 这里统一过一遍 resolveExecutable，避免 ENOENT（见 util.mjs）。
+      powBin: resolveExecutable(path.resolve(ROOT, expandHome(str(env.POW_BIN, 'bin/ds-pow')))),
+      // PoW 求解器每个任务的 goroutine 数。0 = 交给 Go 用 runtime.NumCPU()。
+      // 高并发时可以调小（实测：并发 8 时每任务 2 个 worker 比 4 个更快收敛），
+      // 因为 N 个并发 solve 各起 NumCPU 个 goroutine 会互相抢核。
+      powWorkers: int(env.POW_WORKERS, 0),
+      // 每个账号同时在途的请求上限：0 = 不限（纯轮询）。
+      // 号池只有一个号时它不起作用；多个号时它把并发摊开，避免全压在一个号上撞风控。
+      maxInflightPerAccount: int(env.MAX_INFLIGHT_PER_ACCOUNT, 0),
     },
     deepseek: {
       baseUrl,

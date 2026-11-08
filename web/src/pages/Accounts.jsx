@@ -22,7 +22,7 @@ const MODE_OPTIONS = [
   { value: 'replace', label: '替换全部（覆盖号池）' },
 ];
 
-export default function Accounts() {
+export default function Accounts({ hasToken, onConfigured }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   const [input, setInput] = useState('');
@@ -32,6 +32,9 @@ export default function Accounts() {
   const [verifyResults, setVerifyResults] = useState(null);
   const [pendingRestart, setPendingRestart] = useState(false);
   const [restarting, setRestarting] = useState(false);
+
+  // 是否处于"首次配置"状态：服务端说没有 token，且本地也确实没存过
+  const needsSetup = hasToken === false && !(data?.savedCount > 0);
 
   const load = useCallback(async () => {
     try {
@@ -78,7 +81,15 @@ export default function Accounts() {
       await load();
       toast(`已保存 ${result.savedCount} 个 token`);
       if (result.restartRequired) {
-        await notify(result.message, '需要重启生效');
+        // 首次配置时把"需要重启"说得更明确：不重启就一直用不了
+        await notify(
+          needsSetup
+            ? 'token 已保存。还差最后一步：重启服务让新号池生效，之后就能正常对话了。'
+            : result.message,
+          needsSetup ? '配置已保存，需要重启' : '需要重启生效',
+        );
+      } else {
+        onConfigured?.();
       }
     } catch (err) {
       await notify(err.message, '保存失败');
@@ -122,6 +133,8 @@ export default function Accounts() {
         setPendingRestart(false);
         await load();
         toast('服务已恢复，号池已加载');
+        // 首次配置完成：回到概览页，让用户看到"已就绪"的状态
+        if (needsSetup) onConfigured?.();
       } else {
         await notify('重启后 45 秒内没有恢复，请到日志页查看原因。', '重启超时');
       }
@@ -154,6 +167,33 @@ export default function Accounts() {
 
       {error ? <ErrorBanner message={error} onRetry={load} /> : null}
 
+      {needsSetup ? (
+        <Card title="第 1 步：获取 userToken" subtitle="还没有配置登录态，完成下面的步骤就能开始用">
+          <div className="stack">
+            <ol className="setup-steps">
+              <li>
+                用浏览器打开{' '}
+                <a href="https://chat.deepseek.com" target="_blank" rel="noreferrer">
+                  chat.deepseek.com
+                </a>{' '}
+                并登录
+              </li>
+              <li>
+                按 <kbd>F12</kbd> 打开开发者工具，切到 <kbd>Console</kbd> 标签
+              </li>
+              <li>
+                执行下面这行，复制输出的那一串：
+                <div className="setup-code">localStorage.getItem(&quot;userToken&quot;)</div>
+              </li>
+              <li>把复制到的内容粘贴到下面的输入框，点「校验登录态」确认有效，再点「保存」</li>
+            </ol>
+            <Banner tone="info" icon="info">
+              输出的可能是 <code>{'{"value":"...","__version":"0"}'}</code> 这样的 JSON，直接整段粘贴即可，会自动解析出里面的 token。
+            </Banner>
+          </div>
+        </Card>
+      ) : null}
+
       {pendingRestart ? (
         <Banner
           tone="warn"
@@ -168,7 +208,10 @@ export default function Accounts() {
         </Banner>
       ) : null}
 
-      <Card title="添加 / 更新 token" subtitle="粘贴后可以先校验登录态，再保存">
+      <Card
+        title={needsSetup ? '第 2 步：粘贴并保存' : '添加 / 更新 token'}
+        subtitle="粘贴后可以先校验登录态，再保存"
+      >
         <div className="stack">
           <TextField
             label="userToken（可多行）"

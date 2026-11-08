@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+
 import { ApiError } from './errors.mjs';
 
 const TEXT_PART_TYPES = new Set(['text', 'input_text']);
@@ -81,6 +83,29 @@ export function commonPrefixLength(a, b) {
   let i = 0;
   while (i < max && a.charCodeAt(i) === b.charCodeAt(i)) i += 1;
   return i;
+}
+
+/**
+ * 解析可执行文件路径，处理 Windows 的 PATHEXT 问题。
+ *
+ * `go build -o bin/ds-pow` 在 Windows 上产出的文件就叫 `bin/ds-pow`（不带 `.exe`），
+ * shell 能跑，但 Node 的 `spawn` **只对不带路径的命令名**按 PATHEXT 补扩展名；
+ * 这里给的是完整路径，所以不会补，直接报 `spawn ... ENOENT`。
+ *
+ * 规则：
+ *   1. 原路径已存在 → 原样返回（Linux/macOS 行为不变，Windows 上手动改名成 `.exe` 也照旧可用）；
+ *   2. Windows：依次尝试 `.exe` / `.cmd` / `.bat`，命中就用；
+ *   3. 都不存在 → 返回原路径，让调用方照常报"找不到，先 npm run pow:build"。
+ */
+export function resolveExecutable(p, platform = process.platform, exists = (f) => fs.existsSync(f)) {
+  if (!p) return p;
+  if (exists(p)) return p;
+  if (platform !== 'win32') return p;
+  for (const ext of ['.exe', '.cmd', '.bat']) {
+    const candidate = `${p}${ext}`;
+    if (exists(candidate)) return candidate;
+  }
+  return p;
 }
 
 export const sleep = (ms, signal) =>

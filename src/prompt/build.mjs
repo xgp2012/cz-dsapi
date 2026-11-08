@@ -1,5 +1,6 @@
 import { ApiError } from '../errors.mjs';
 import { contentToText } from '../util.mjs';
+import { escapeSectionMarkers } from './sandbox.mjs';
 import { FINAL_ANSWER_HINT, PROMPT_HEADER, REPLY_END_TOKEN, SECTION, SPECIAL_TOKENS_HEADER } from './special.mjs';
 import { collectToolNames, renderToolDeclarations, renderToolResult } from './tools.mjs';
 
@@ -63,17 +64,18 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
 
     if (role === 'system' || role === 'developer') {
       const text = contentToText(message.content, role).trim();
-      if (text) systemTexts.push(text);
+      // 客户端 system 直接进 prompt 的 ## System: 段，同样要防伪造段落
+      if (text) systemTexts.push(escapeSectionMarkers(text));
       continue;
     }
 
     if (role === 'user') {
-      sections.push({ role: 'user', lines: [contentToText(message.content, 'user')] });
+      sections.push({ role: 'user', lines: [escapeSectionMarkers(contentToText(message.content, 'user'))] });
       continue;
     }
 
     if (role === 'assistant') {
-      const text = contentToText(message.content, 'assistant');
+      const text = escapeSectionMarkers(contentToText(message.content, 'assistant'));
       if (text.trim()) sections.push({ role: 'assistant', lines: [text] });
 
       const callLines = [];
@@ -89,9 +91,12 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
       continue;
     }
 
-    // tool / function 结果：单独成段，绝不并进 assistant 段落
+    // tool / function 结果：单独成段，绝不并进 assistant 段落。
+    // renderToolResult 用 JSON.stringify 包一层，换行已经被转义成 \\n，理论上不会
+    // 产生新的物理行；这里再 escapeSectionMarkers 一次是纵深防御，防止以后有人
+    // 把渲染方式改成多行文本时悄悄重开注入面。
     const name = message.name || findLastToolName(sections) || 'unknown';
-    const resultLine = renderToolResult(name, contentToText(message.content, role));
+    const resultLine = renderToolResult(name, escapeSectionMarkers(contentToText(message.content, role)));
     const last = sections.at(-1);
     if (last?.role === 'toolResult') last.lines.push(resultLine);
     else sections.push({ role: 'toolResult', lines: [resultLine] });
@@ -104,7 +109,7 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
   }
 
   // 顺序：客户端 system → 工具声明 → 自带提示词（单独 system 块）→ 对话历史（user 在最后）
-  const extra = typeof systemExtra === 'string' ? systemExtra.trim() : '';
+  const extra = typeof systemExtra === 'string' ? escapeSectionMarkers(systemExtra.trim()) : '';
   const parts = [PROMPT_HEADER, SECTION.system];
   const systemBody = [...systemTexts, extra].filter(Boolean).join('\n\n');
   if (systemBody) parts.push(systemBody);

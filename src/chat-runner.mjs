@@ -1,4 +1,4 @@
-import { PromptTooLongError } from './errors.mjs';
+import { ApiError, PromptTooLongError } from './errors.mjs';
 import { loadImage } from './openai/images.mjs';
 import {
   findToolMarkup,
@@ -43,9 +43,14 @@ export function createChatRunner({ config, log, web }) {
     const prompt = initial.prompt;
 
     // 图片：下载/解码 → 传成 DeepSeek 附件 → ref_file_ids
+    // uploadImages 在引擎契约里是可选的：缺失时应按"不支持图片"回 400，
+    // 而不是让 TypeError 冒泡成 500（与 uploadAttachments 的守卫对称）。
     const imageIds = [];
     if (request.images?.length) {
-      const loaded = await Promise.all(request.images.map((image) => loadImage(image.url)));
+      if (typeof web.uploadImages !== 'function') {
+        throw new ApiError(400, '当前引擎不支持图片输入', { code: 'image_not_supported' });
+      }
+      const loaded = await Promise.all(request.images.map((image) => loadImage(image.url, { logger: log })));
       imageIds.push(...(await web.uploadImages(loaded)));
       log?.info?.('已上传图片', { count: imageIds.length });
     }
@@ -90,7 +95,10 @@ export function createChatRunner({ config, log, web }) {
      * 模型输出的工具调用走原生 DSML（唯一协议），解析层转成标准 tool_calls；
      * 其他历史格式（<tool_call> / 原生 token / 旧版 DO）只做静默兜底，不再记日志。
      */
-    const evaluate = (text) => {
+    const evaluate = (rawText) => {
+      // 引擎契约是鸭子类型：结果里 text/reasoning 缺失或不是字符串时不要直接崩，
+      // 否则一个返回不完整的引擎/适配层会把整轮变成 500（而不是一条空回答）。
+      const text = typeof rawText === 'string' ? rawText : '';
       const parsed = parseToolCalls(text, knownTools);
       // 不再做「重复调用抑制」：agent 里同一个调用原样重发是正常操作（每一步之后重新 observe_screen），
       // 按签名去重会把整轮输出吞成空回答。

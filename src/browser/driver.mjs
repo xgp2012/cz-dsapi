@@ -54,7 +54,10 @@ export class DeepSeekWeb {
 
   async ensureStarted() {
     if (this.closing) throw new UpstreamError('服务正在关闭');
-    if (this.browser?.isConnected()) return;
+    // 必须同时检查 context：`#launch` 中途 browser 已经连上但 context 还是 null，
+    // 此时只判 browser 会让并发请求"以为起来了"，随后 #ensurePage 里
+    // this.context.newPage() 抛 TypeError（Cannot read properties of null）。
+    if (this.browser?.isConnected() && this.context) return;
     if (this.launching) return this.launching;
 
     this.launching = this.#launch().finally(() => {
@@ -206,16 +209,30 @@ export class DeepSeekWeb {
    * 页面池
    * ------------------------------------------------------------------ */
 
-  async #acquireSlot() {
-    const release = await this.semaphore.acquire();
+  async #acquireSlot({ signal } = {}) {
+    // 传 signal：客户端排队期间断开要立刻出队，不能占着 QUEUE_LIMIT
+    const release = await this.semaphore.acquire({ signal });
+    if (signal?.aborted) {
+      release();
+      throw new UpstreamError('客户端已断开', { status: 499, code: 'client_closed' });
+    }
+
     let slot = this.slots.find((s) => !s.busy);
     if (!slot) {
       slot = { page: null, busy: false };
       this.slots.push(slot);
     }
 
-    // 预热点没做完就等它一下，避免它把新请求的输入框/开关重置掉
-    for (let i = 0; i < 25 && slot.preWarming; i += 1) await sleep(20);
+    // 预热点没做完就等它一下，避免它把新请求的输入框/开关重置掉。
+    // 等待期间要能被取消，否则客户端断开了还会在这儿空转 500ms。
+    for (let i = 0; i < 25 && slot.preWarming; i += 1) {
+      if (signal?.aborted) break;
+      await sleep(20, signal).catch(() => {});
+    }
+    if (signal?.aborted) {
+      release();
+      throw new UpstreamError('客户端已断开', { status: 499, code: 'client_closed' });
+    }
 
     slot.busy = true;
     try {
@@ -333,7 +350,7 @@ export class DeepSeekWeb {
 
     const attempt = async (n) => {
       const tStart = Date.now();
-      const { slot, release } = await this.#acquireSlot();
+      const { slot, release } = await this.#acquireSlot({ signal });
       const page = slot.page;
       try {
         const tPage = Date.now();
@@ -468,8 +485,10 @@ export class DeepSeekWeb {
     }
   }
 
-  async #typeAndSend(page, prompt) {
-    // 账号级限流：两次发送之间至少隔 SEND_INTERVAL_MS，命中限流后还要等冷却
+  async #typeAndSend(page, prompt, { signal } = {}) {
+    // 账号级限流：两次发送之间至少隔 SEND_INTERVAL_MS，命中限流后还要等冷却。
+    // 这里的 wait 必须是可取消的：客户端断开后还占着唯一的发送名额 4s~60s，
+    // 会把后面所有请求一起拖住。
     const now = Date.now();
     const wait = Math.max(
       (this.lastSendAt || 0) + this.config.runtime.sendIntervalMs - now,
@@ -477,7 +496,7 @@ export class DeepSeekWeb {
     );
     if (wait > 0) {
       this.log.debug(`等待发送窗口 ${Math.round(wait / 100) / 10}s`);
-      await sleep(wait);
+      await sleep(wait, signal);
     }
 
     const focused = await page.evaluate(() => window.__DSW__.focusInput());
@@ -502,11 +521,24 @@ export class DeepSeekWeb {
         if (ok) await page.keyboard.insertText(prompt);
       });
 
+    // 先占位（避免同一瞬间两个 slot 都被放行），确认发送失败时回滚这个窗口。
+    // 原实现把 lastSendAt 写在 press('Enter') 之后、确认之前：一旦发送被风控静默吞掉，
+    // 这个"假成功"会白白吞掉一个发送窗口，重试要额外多等一整个 SEND_INTERVAL_MS。
+    const slotAt = Date.now();
+    this.lastSendAt = slotAt;
+
     const before = await this.#state(page);
     await page.keyboard.press('Enter');
-    this.lastSendAt = Date.now();
 
-    const sent = await this.#confirmSent(page, before);
+    let sent = false;
+    try {
+      sent = await this.#confirmSent(page, before);
+    } finally {
+      if (!sent) {
+        // 回滚：只有本次占位仍是"最新"时才退回，别把别人的窗口抹掉
+        if (this.lastSendAt === slotAt) this.lastSendAt = slotAt - this.config.runtime.sendIntervalMs;
+      }
+    }
     if (!sent) throw new UpstreamError('消息未能发送（可能触发风控或输入过长）', { code: 'send_failed' });
   }
 
@@ -790,7 +822,7 @@ export class DeepSeekWeb {
     // 原始补全流还在收、但 DOM 长时间不再变化时的兜底上限：超过就结束轮询，交给 capture 补齐
     const captureStallMs = Math.max(settleMs * 10, 30_000);
 
-    await this.#typeAndSend(page, prompt);
+    await this.#typeAndSend(page, prompt, { signal });
     const sentAt = Date.now();
     progress.sentAt = sentAt;
 

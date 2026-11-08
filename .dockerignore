@@ -1,0 +1,41 @@
+# 构建上下文越小，CI 越快。这个项目有几个大目录必须排除：
+# dist/ 是打好的 Windows exe（约 300MB）；node_modules / web/node_modules 以千计文件。
+
+# 依赖与产物（镜像内会重新安装 / 编译）
+node_modules/
+web/node_modules/
+web/dist/
+
+# Windows 打包产物
+dist/
+.build-exe/
+
+# 数据与配置（运行时挂载，绝不进镜像）
+data/
+.env
+*.log
+*.bak
+
+# Go 编译产物（镜像内由 builder 阶段产出）
+bin/
+
+# 测试与开发残留
+test/.artifacts/
+coverage/
+*.test.mjs
+
+# 仓库元数据与编辑器
+.git/
+.gitignore
+.github/
+.vscode/
+.idea/
+.DS_Store
+
+# 文档（镜像里用不到）
+docs/
+*.md
+
+# 其他平台的构建脚本
+scripts/build-exe.mjs
+scripts/package.mjs

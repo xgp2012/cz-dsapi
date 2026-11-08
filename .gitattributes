@@ -1,0 +1,23 @@
+# 统一换行符，避免 Windows 上编辑后把 LF 提交成 CRLF。
+#
+# 关键：Dockerfile、.dockerignore、*.yml、*.mjs 必须是 LF ——
+#   - Dockerfile 里的行尾 \ 续行在 CRLF 下会被当成字面量 \r，构建直接报错
+#   - shell 脚本 CRLF 会导致 "bad interpreter: /bin/bash^M"
+* text=auto eol=lf
+
+# Windows 批处理必须保持 CRLF，否则 cmd 解析会出错
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制
+*.exe binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.zip binary

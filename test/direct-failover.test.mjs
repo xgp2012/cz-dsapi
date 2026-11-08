@@ -15,11 +15,13 @@ import {
   TimeoutError,
   UpstreamError,
 } from '../src/errors.mjs';
+import { resolveExecutable } from '../src/util.mjs';
 
 const logger = { info() {}, warn() {}, debug() {}, error() {} };
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const powBin = path.join(root, 'bin', 'ds-pow');
+// Windows 上产物可能是 bin/ds-pow 或 bin/ds-pow.exe
+const powBin = resolveExecutable(path.join(root, 'bin', 'ds-pow'));
 
 const BAD_TOKEN = 'bad-token-0123456789abcdef';
 const GOOD_TOKEN = 'good-token-0123456789abcdef';

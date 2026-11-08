@@ -11,15 +11,27 @@ import path from 'node:path';
  * 每个账号有独立的：门禁（冷却）、PoW 预解、会话预建、设备 ID。
  */
 export class AccountPool {
-  constructor({ tokens, dataDir, logger }) {
+  constructor({ tokens, dataDir, logger, maxInflightPerAccount = 0 }) {
     this.log = logger;
     this.dataDir = dataDir;
+    /**
+     * 每个账号同时在途的请求上限（0 = 不限）。
+     *
+     * 不加限制时，纯轮询会把**所有**并发请求压到同一个账号上（游标转一圈还是它，
+     * 因为它一直"有空"），于是该账号的 PoW 预解/会话预建被抢空、风控集中命中，
+     * 而其它账号闲着。有上限时请求会自动摊到还没打满的账号上。
+     */
+    this.maxInflightPerAccount = Math.max(0, Number(maxInflightPerAccount) || 0);
     this.accounts = tokens.map((token, index) => ({
       index,
       token,
       deviceId: loadDeviceId(dataDir, token),
-      powNext: null,
+      /** 预解好的 PoW：数组，每个请求取走一个（并发时才能各自拿到，只留一个会立刻被抢空） */
+      powPool: [],
+      powPending: null,
       sessionPool: [],
+      /** 在途请求数，配合 maxInflightPerAccount 做摊分 */
+      inflight: 0,
       cooldownUntil: 0,
       limitedCount: 0,
       errorCount: 0,
@@ -37,18 +49,35 @@ export class AccountPool {
     return this.accounts.length;
   }
 
-  /** 轮询取一个不在冷却的账号；全都在冷却就返回 null */
+  /** 这个账号现在能不能接新活 */
+  #usable(account, now) {
+    if (account.cooldownUntil > now) return false;
+    if (this.maxInflightPerAccount > 0 && account.inflight >= this.maxInflightPerAccount) return false;
+    return true;
+  }
+
+  /** 轮询取一个可用账号；全都不可用就返回 null */
   pick(now = Date.now()) {
     for (let i = 0; i < this.accounts.length; i += 1) {
       const account = this.accounts[(this.cursor + i) % this.accounts.length];
-      if (account.cooldownUntil <= now) {
+      if (this.#usable(account, now)) {
         this.cursor = (account.index + 1) % this.accounts.length;
         account.lastUsedAt = now;
         account.requests += 1;
+        account.inflight += 1;
         return account;
       }
     }
     return null;
+  }
+
+  /**
+   * 归还一个账号（请求结束时调用，与 pick 成对）。
+   * 必须在 finally 里调，否则 inflight 只增不减，最终把账号永久锁死。
+   */
+  release(account) {
+    if (!account) return;
+    account.inflight = Math.max(0, account.inflight - 1);
   }
 
   /** 最近的可用时间 */
@@ -59,7 +88,7 @@ export class AccountPool {
 
   /** 池里还有没有立刻能用的账号（只看状态，不消耗轮询游标） */
   hasAvailable(now = Date.now()) {
-    return this.accounts.some((a) => a.cooldownUntil <= now);
+    return this.accounts.some((a) => this.#usable(a, now));
   }
 
   /** 是否所有账号都因为登录态失效被停用 */
@@ -114,15 +143,18 @@ export class AccountPool {
       errors: a.errorCount,
       lastError: a.lastError,
       authFailed: a.authFailed,
-      powReady: Boolean(a.powNext),
+      inflight: a.inflight,
+      powReady: a.powPool.length,
       sessionsReady: a.sessionPool.length,
     }));
   }
 
   close() {
     for (const account of this.accounts) {
-      account.powNext = null;
+      account.powPool = [];
+      account.powPending = null;
       account.sessionPool = [];
+      account.inflight = 0;
     }
   }
 }

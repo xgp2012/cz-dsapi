@@ -16,9 +16,21 @@ import {
 import { SseWriter } from './openai/sse.mjs';
 import { reconcileStreamedText } from './openai/tool-text.mjs';
 import { escapeHtml, readJsonBody as readJson, requireApiKey as requireAuth, sendHtml, sendJson } from './http.mjs';
+import { RateLimiter, clientIp, rateLimitedError } from './rate-limit.mjs';
+
+/** 会消耗上游账号额度的路径：这些才需要入口限流 */
+const CONSUMPTIVE = /^\/(v1\/(chat\/completions|completions|messages(\/count_tokens)?))$/;
 
 export function createServer({ config, logger, web }) {
   const log = logger.child('http');
+
+  const limiter = new RateLimiter({
+    capacity: config.server.rateLimit?.capacity,
+    refillPerSec: config.server.rateLimit?.refillPerSec,
+    maxBuckets: config.server.rateLimit?.maxBuckets,
+    enabled: config.server.rateLimit?.enabled !== false,
+  });
+  const stopSweep = limiter.startSweep();
 
   const server = http.createServer((req, res) => {
     handle(req, res).catch((err) => {
@@ -32,7 +44,8 @@ export function createServer({ config, logger, web }) {
   const runChat = createChatRunner({ config, log, web });
   const anthropic = createAnthropicHandler({ config, log, runChat, sendJson });
   /** 网页控制台：/admin 静态页 + /admin/api/* 管理接口 */
-  const admin = createAdminHandler({ config, logger, web });
+  // 传 server 是为了让「重启」在打包版里能先释放端口再拉起新进程
+  const admin = createAdminHandler({ config, logger, web, server });
 
   async function handle(req, res) {
     const started = Date.now();
@@ -63,6 +76,11 @@ export function createServer({ config, logger, web }) {
           pid: process.pid,
           uptime_s: Math.round(process.uptime()),
           ...web.status(),
+          // 控制台据此决定要不要显示"首次配置"引导。
+          // 注意用 hasToken 而不是 token：后者在 admin overview 里是打码后的字符串，
+          // 这里是布尔值，语义更明确。
+          hasToken: config.deepseek.tokens.length > 0,
+          token: config.deepseek.tokens.length > 0,
           version: 1,
         });
       }
@@ -77,15 +95,29 @@ export function createServer({ config, logger, web }) {
         return await admin(req, res, url);
       }
 
+      // ---- 入口限流 ----
+      // 只对真正会消耗上游额度的路径限流；/healthz、/、/admin、/v1/models 这些
+      // 不碰 DeepSeek 的请求不限，否则健康检查会被自己限死。
+      if (CONSUMPTIVE.test(url.pathname)) {
+        const ip = clientIp(req, { trustProxy: config.server.trustProxy });
+        const result = limiter.take(ip);
+        res.setHeader('X-RateLimit-Limit', String(limiter.capacity));
+        res.setHeader('X-RateLimit-Remaining', String(result.remaining));
+        if (!result.allowed) {
+          log.warn('入口限流触发', { ip, path: url.pathname });
+          throw rateLimitedError(result);
+        }
+      }
+
       if (req.method === 'GET' && url.pathname === '/v1/models') {
         requireAuth(req, config);
-        return sendJson(res, 200, modelsResponse());
+        return sendJson(res, 200, modelsResponse(config));
       }
 
       if (req.method === 'GET' && url.pathname.startsWith('/v1/models/')) {
         requireAuth(req, config);
         const id = decodeURIComponent(url.pathname.slice('/v1/models/'.length));
-        const model = modelsResponse().data.find((m) => m.id === id);
+        const model = modelsResponse(config).data.find((m) => m.id === id);
         if (!model) throw new ApiError(404, `模型不存在: ${id}`, { code: 'model_not_found' });
         return sendJson(res, 200, model);
       }
@@ -337,6 +369,9 @@ export function createServer({ config, logger, web }) {
     });
     sse.done();
   }
+
+  // 关服务时停掉限流的清理定时器（已经 unref，这里只是显式收尾）
+  server.on('close', () => stopSweep());
 
   return server;
 }

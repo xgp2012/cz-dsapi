@@ -73,7 +73,16 @@ test('GET /v1/models', async () => {
     assert.equal(res.status, 200);
     const json = await res.json();
     assert.equal(json.object, 'list');
+    // 默认模型必须在列表里，否则客户端按 /v1/models 选出来的 id
+    // 与 POST 不带 model 时用的默认值对不上
     assert.ok(json.data.some((m) => m.id === 'deepseek-flash'));
+
+    // 列表里能看到的 id，GET 单个也必须能取到（曾经这里 404）
+    const one = await fetch(`${base}/v1/models/deepseek-flash`);
+    assert.equal(one.status, 200);
+    const model = await one.json();
+    assert.equal(model.id, 'deepseek-flash');
+    assert.equal(model.object, 'model');
   });
 });
 

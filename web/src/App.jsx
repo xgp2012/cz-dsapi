@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { setTheme } from 'mdui';
 
 import { getApiKey, setApiKey, setUnauthorizedHandler } from './api.js';
@@ -39,6 +39,32 @@ export default function App({ initialTheme = 'auto' }) {
   const [theme, setThemeState] = useState(initialTheme);
   const [keyDialogOpen, setKeyDialogOpen] = useState(false);
   const [keyDraft, setKeyDraft] = useState('');
+  // null = 还在探测；true/false = 是否已有登录态
+  const [hasToken, setHasToken] = useState(null);
+
+  /**
+   * 探测"登录态配好没有"。
+   *
+   * 服务在没配 token 时也能启动（否则用户根本进不来控制台），
+   * 所以这里要主动问一次 /healthz，没配就**直接把用户送到「账号」页**，
+   * 而不是让他自己在菜单里找。
+   */
+  const probeSetup = useCallback(async () => {
+    try {
+      const res = await fetch('/healthz', { cache: 'no-store' });
+      if (!res.ok) return;
+      const body = await res.json();
+      const ready = Boolean(body.hasToken ?? body.token);
+      setHasToken(ready);
+      if (!ready) setPage('accounts');
+    } catch {
+      /* 服务没起来时忽略，页面自身的请求会报错 */
+    }
+  }, []);
+
+  useEffect(() => {
+    probeSetup();
+  }, [probeSetup]);
 
   useEffect(() => {
     setUnauthorizedHandler(() => {
@@ -127,7 +153,15 @@ export default function App({ initialTheme = 'auto' }) {
         </aside>
 
         <main className="main">
-          <Page key={`${page}-${refreshKey}`} navigate={setPage} />
+          <Page
+            key={`${page}-${refreshKey}`}
+            navigate={setPage}
+            hasToken={hasToken}
+            onConfigured={() => {
+              setHasToken(true);
+              setPage('overview');
+            }}
+          />
           <div className="footer-note">
             fuckds · 控制台跑在同一个 Node 进程里 · 接口文档见「文档」页
           </div>
