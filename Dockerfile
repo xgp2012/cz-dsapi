@@ -73,9 +73,11 @@ RUN npm ci --omit=dev --no-audit --no-fund || npm install --omit=dev --no-audit 
 
 # 浏览器装到固定路径，运行时用 PLAYWRIGHT_BROWSERS_PATH 指过去。
 # 只装 headless shell：体积比完整 chromium 小一半，而本服务始终 headless 运行。
+#
+# 这里**不带 --with-deps**：上面已经用 apt 装好了全部运行库，
+# --with-deps 会再跑一遍 apt 并多产生一层（实测多 1.6MB 且让层数变多）。
 ENV PLAYWRIGHT_BROWSERS_PATH=/app/ms-playwright
-RUN npx playwright install --with-deps chromium-headless-shell \
-    && rm -rf /var/lib/apt/lists/*
+RUN npx playwright install chromium-headless-shell
 
 # 程序本体
 COPY src/ ./src/
@@ -91,7 +93,11 @@ COPY --from=pow /out/ds-pow ./bin/ds-pow
 RUN chmod +x ./bin/ds-pow
 
 # 数据目录：auth.json（号池）和日志落在这里，挂卷持久化
-RUN mkdir -p /app/data && chown -R node:node /app
+#
+# 只 chown 数据目录，**不要** chown -R /app：
+# 那会把刚装好的 Chromium（约 210MB）整份复制到新的一层，镜像白胖 109MB（实测）。
+# /app 下其余文件都是 root 拥有但只读，进程以 node 身份运行时不需要写权限。
+RUN mkdir -p /app/data && chown -R node:node /app/data
 
 # 用非 root 跑：容器里跑浏览器 + 处理外部输入，没必要给 root
 USER node
