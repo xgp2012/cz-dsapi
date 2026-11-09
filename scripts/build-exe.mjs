@@ -2,7 +2,7 @@
  * 构建 Windows 单 exe 发行包。
  *
  * 产出 dist/win-x64/：
- *   fuckds.exe            单文件可执行（Node SEA）
+ *   cz-dsapi.exe          单文件可执行（Node SEA）
  *   启动.bat              双击启动
  *   .env.example / data/  配置与运行时数据
  *   src/                  程序源码（ESM，运行时由 exe 动态 import）
@@ -98,7 +98,7 @@ fs.mkdirSync(BUILD, { recursive: true });
 /**
  * 入口必须是 CJS（SEA 只支持 CJS 作为 main）。
  * 它做三件事：
- *   1) 把 exe 所在目录定为项目根，并通过 FUCKDS_ROOT 告知 config.mjs；
+ *   1) 把 exe 所在目录定为项目根，并通过 CZDSAPI_ROOT 告知 config.mjs；
  *   2) 设置 PLAYWRIGHT_BROWSERS_PATH 指向自带的 ms-playwright/；
  *   3) 动态 import 真实的 src/index.mjs。
  */
@@ -110,8 +110,8 @@ const { pathToFileURL } = require('node:url');
 
 const base = path.dirname(process.execPath);
 
-// config.mjs 用 FUCKDS_ROOT（若存在）而不是 import.meta.dirname 推导项目根
-process.env.FUCKDS_ROOT = process.env.FUCKDS_ROOT || base;
+// config.mjs 用 CZDSAPI_ROOT（若存在）而不是 import.meta.dirname 推导项目根
+process.env.CZDSAPI_ROOT = process.env.CZDSAPI_ROOT || base;
 
 // 浏览器缓存随包分发
 const bundledBrowsers = path.join(base, 'ms-playwright');
@@ -125,7 +125,7 @@ try { fs.mkdirSync(path.join(base, 'data'), { recursive: true }); } catch {}
 const entryFile = path.join(base, 'src', 'index.mjs');
 if (!fs.existsSync(entryFile)) {
   console.error('\\n找不到 ' + entryFile);
-  console.error('请确认 src/ 与 fuckds.exe 在同一个目录（解压不完整？）\\n');
+  console.error('请确认 src/ 与 cz-dsapi.exe 在同一个目录（解压不完整？）\\n');
   process.exit(1);
 }
 
@@ -177,7 +177,7 @@ fs.mkdirSync(OUT, { recursive: true });
 
 // 用 step 2 的 node 原型复制出来，但原 exe 被 SEA 注入后会破坏签名，
 // 所以这里复制一份干净的 node.exe 作为基底
-const exePath = path.join(OUT, 'fuckds.exe');
+const exePath = path.join(OUT, 'cz-dsapi.exe');
 // process.execPath 就是当前 node.exe，没有被注入过
 fs.copyFileSync(process.execPath, exePath);
 
@@ -197,7 +197,7 @@ if (inject.status !== 0) {
   console.error(inject.stdout || '', inject.stderr || '');
   die('SEA blob 注入失败');
 }
-ok(`fuckds.exe: ${mb(fs.statSync(exePath).size)}（含 blob）`);
+ok(`cz-dsapi.exe: ${mb(fs.statSync(exePath).size)}（含 blob）`);
 
 // ---------------------------------------------------------------- 4. 外置依赖
 
@@ -332,12 +332,12 @@ const batContent = [
   'for /f "usebackq tokens=1,* delims==" %%a in (`findstr /b /c:"PORT=" ".env" 2^>nul`) do set "_FU_PORT=%%b"',
   '',
   'echo ============================================================',
-  'echo   fuckds 正在启动，按 Ctrl+C 可停止',
+  'echo   cz-dsapi 正在启动，按 Ctrl+C 可停止',
   'echo ============================================================',
   'echo.',
   'rem 稍等片刻再开浏览器：服务 listen 是异步的，太早打开会显示连接失败',
   'start "" cmd /c "timeout /t 3 /nobreak >nul & start http://127.0.0.1:%_FU_PORT%/admin/"',
-  'fuckds.exe',
+  'cz-dsapi.exe',
   'set "_FU_CODE=%ERRORLEVEL%"',
   'echo.',
   'if not "%_FU_CODE%"=="0" (',
@@ -449,12 +449,12 @@ for (const junk of ['debug.log', '.probe-browser.mjs', 'chrome_debug.log']) {
 
 if (!noZip) {
   log('打包 zip');
-  const zipName = path.join(DIST, 'fuckds-win-x64.zip');
+  const zipName = path.join(DIST, 'cz-dsapi-win-x64.zip');
   fs.rmSync(zipName, { force: true });
   // 用 .NET 的 ZipFile 避免 Compress-Archive 对中文路径/大目录的性能问题。
   //
   // 注意 CreateFromDirectory 会把**目录本身**作为压缩包的根，也就是解压后
-  // 多一层 win-x64/。为了让用户解压出来就是"fuckds.exe 在最外层"，
+  // 多一层 win-x64/。为了让用户解压出来就是"cz-dsapi.exe 在最外层"，
   // 这里创建后把内部条目统一去掉那一层前缀。
   const ps = spawnSync(
     'powershell.exe',

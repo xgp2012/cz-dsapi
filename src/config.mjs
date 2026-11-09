@@ -8,11 +8,11 @@ import { parseEnvText, resolveExecutable } from './util.mjs';
  * 项目根目录。
  *
  * 默认按源码位置推导（src/ 的上一级）。但 SEA 打包成 exe 后，`import.meta.dirname`
- * 不再是一个真实可用的目录（入口是内嵌的），所以打包入口会预先设置 FUCKDS_ROOT
+ * 不再是一个真实可用的目录（入口是内嵌的），所以打包入口会预先设置 CZDSAPI_ROOT
  * 为 exe 所在目录。这样 exe 与 src/ 同级放置时，.env / data / bin / web 都能照常找到。
  */
-const ROOT = process.env.FUCKDS_ROOT
-  ? path.resolve(process.env.FUCKDS_ROOT)
+const ROOT = process.env.CZDSAPI_ROOT
+  ? path.resolve(process.env.CZDSAPI_ROOT)
   : path.resolve(import.meta.dirname, '..');
 
 /* ------------------------------------------------------------------ *

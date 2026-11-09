@@ -28,7 +28,7 @@ const COMPONENTS = {
   docs: Docs,
 };
 
-const THEME_KEY = 'fuckds-admin-theme';
+const THEME_KEY = 'cz-dsapi-admin-theme';
 const THEME_ORDER = ['auto', 'light', 'dark'];
 const THEME_ICON = { auto: 'brightness_auto', light: 'light_mode', dark: 'dark_mode' };
 const THEME_LABEL = { auto: '主题：跟随系统', light: '主题：浅色', dark: '主题：深色' };
@@ -107,7 +107,7 @@ export default function App({ initialTheme = 'auto' }) {
   return (
     <div className="layout">
       <mdui-top-app-bar>
-        <mdui-top-app-bar-title>fuckds 控制台</mdui-top-app-bar-title>
+        <mdui-top-app-bar-title>cz-dsapi 控制台</mdui-top-app-bar-title>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 4, alignItems: 'center' }}>
           <Btn variant="text" icon="open_in_new" href="/" target="_blank">
             接口首页
@@ -163,7 +163,7 @@ export default function App({ initialTheme = 'auto' }) {
             }}
           />
           <div className="footer-note">
-            fuckds · 控制台跑在同一个 Node 进程里 · 接口文档见「文档」页
+            cz-dsapi · 控制台跑在同一个 Node 进程里 · 接口文档见「文档」页
           </div>
         </main>
       </div>

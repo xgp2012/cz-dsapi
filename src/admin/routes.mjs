@@ -474,7 +474,7 @@ export function createAdminHandler({ config, logger, web, server }) {
    *             pm2/systemd 检测）。这些工具都是 Unix 风格的，且 process.execPath
    *             是 node，可以带脚本参数。
    *
-   *   打包 exe：process.execPath 是 fuckds.exe，**不接受脚本参数**，也没有 pgrep/ps，
+   *   打包 exe：process.execPath 是 cz-dsapi.exe，**不接受脚本参数**，也没有 pgrep/ps，
    *             SIGTERM 在 Windows 上也不可靠。所以自己实现：detached 拉起一个新的
    *             exe（继承环境变量，cwd 设为项目根），等它起来后再退出本进程。
    *             顺序很重要 —— 先起新的会撞端口，先退旧的会丢请求；
@@ -482,7 +482,7 @@ export function createAdminHandler({ config, logger, web, server }) {
    *             让端口立刻空出来，再启动。
    */
   async function restartServer() {
-    const packaged = Boolean(process.env.FUCKDS_ROOT) || !/node(\.exe)?$/i.test(path.basename(process.execPath));
+    const packaged = Boolean(process.env.CZDSAPI_ROOT) || !/node(\.exe)?$/i.test(path.basename(process.execPath));
 
     if (packaged) {
       return restartPackaged();
@@ -628,7 +628,7 @@ function clampInt(raw, min, max, fallback) {
 
 function buildMissingPage() {
   return `<!doctype html><html lang="zh-CN"><meta charset="utf-8">
-<title>fuckds 控制台尚未构建</title>
+<title>cz-dsapi 控制台尚未构建</title>
 <style>body{font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;max-width:760px;margin:48px auto;padding:0 20px;color:#1f2328}
 pre{background:#f6f8fa;border:1px solid #e5e7eb;border-radius:8px;padding:14px;overflow:auto;font-size:13px}
 code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}</style>

@@ -1,4 +1,4 @@
-# fuckds 开发文档
+# cz-dsapi 开发文档
 
 > 目标读者：要改这个项目（加协议、修上游变更、调性能）的人。
 > 只讲**实现现状**，不重复 README 里的用户教程。文中所有路径都相对仓库根目录。
@@ -34,7 +34,7 @@
 
 ## 1. 项目定位与不变量
 
-**fuckds 是一个协议适配器**：把 `chat.deepseek.com` 的**网页对话**包装成 OpenAI 兼容 API + Anthropic Messages API。
+**cz-dsapi 是一个协议适配器**：把 `chat.deepseek.com` 的**网页对话**包装成 OpenAI 兼容 API + Anthropic Messages API。
 
 它**不是**模型服务：没有推理、没有权重，全部算力都在上游网页版。它解决的问题只有三个：
 
@@ -1059,7 +1059,7 @@ ApiError(status, message, {type, code, param})
 ### 12.2 前端（`web/`）
 
 - `vite base = '/admin/'`，产物 `web/dist`；dev 时把 `/admin/api`、`/v1`、`/healthz` 代理到 8787；
-- `api.js` 统一：`getApiKey()/setApiKey()`（localStorage `fuckds-admin-api-key`），任何 401 触发全局弹窗；
+- `api.js` 统一：`getApiKey()/setApiKey()`（localStorage `cz-dsapi-admin-api-key`），任何 401 触发全局弹窗；
 - 页面：`Overview / Accounts / Playground / Logs / Settings / Docs`；
 - `Playground` 直接消费 `/v1/chat/completions` 的 SSE，是验证流式输出最快的手段。
 
@@ -1135,7 +1135,7 @@ go test ./... && go test -bench=. -benchmem
 
 ```bash
 npm run exe                              # Windows exe：内含启动自检 + Chromium 自检，失败会中断
-docker build -t fuckds .                 # Docker（需要本地有 docker）
+docker build -t cz-dsapi .                 # Docker（需要本地有 docker）
 gh run list --repo <owner>/<repo>        # 看 CI 结果
 ```
 
@@ -1226,7 +1226,7 @@ npm run exe -- --no-zip        # 只出目录不打 zip
 产物 `dist/win-x64/`：
 
 ```
-fuckds.exe            89.7MB   Node SEA，内嵌启动器
+cz-dsapi.exe          89.7MB   Node SEA，内嵌启动器
 src/                   0.4MB   程序本体（ESM，运行时动态 import）
 node_modules/         10.6MB   playwright + playwright-core
 bin/ds-pow.exe         4.0MB   Go PoW 求解器
@@ -1247,7 +1247,7 @@ SEA 内嵌的代码**一律按 CommonJS 执行**。实测 Node 24，内嵌一个
 所以 exe 承担的职责是"**目标机器不用装 Node**"，而不是"单文件包含一切"。
 `src/`、`node_modules/`、`ms-playwright/` 必须和 exe 放在同一目录。
 
-> 这也是为什么 `config.mjs` 的 `ROOT` 会读 `FUCKDS_ROOT`：SEA 里 `import.meta.dirname` 不可用，
+> 这也是为什么 `config.mjs` 的 `ROOT` 会读 `CZDSAPI_ROOT`：SEA 里 `import.meta.dirname` 不可用，
 > 入口把 `path.dirname(process.execPath)` 传进去，`.env` / `data` / `bin` / `web` 才能照常定位。
 
 **两个必须记住的 playwright 坑**（都会让 browser 引擎在目标机器上直接挂掉）：
@@ -1296,7 +1296,7 @@ SEA 内嵌的代码**一律按 CommonJS 执行**。实测 Node 24，内嵌一个
 
 | server-ctl 依赖 | 在打包版里的实际情况 |
 |---|---|
-| `spawn(process.execPath, [脚本])` | `process.execPath` 是 `fuckds.exe`，SEA 不接受脚本参数 |
+| `spawn(process.execPath, [脚本])` | `process.execPath` 是 `cz-dsapi.exe`，SEA 不接受脚本参数 |
 | `pgrep` / `ps` | Windows 上不存在 |
 | `process.kill(pid, 'SIGTERM')` | Windows 上不可靠（无真正的信号语义） |
 | `scripts/` 目录 | 根本没有被打进发行包 |
@@ -1304,7 +1304,7 @@ SEA 内嵌的代码**一律按 CommonJS 执行**。实测 Node 24，内嵌一个
 早期版本直接把这个脚本路径写死，于是打包版点「重启」只会报
 `找不到重启脚本：...\scripts\server-ctl.mjs`。
 
-现在 `restartServer()` 按 `Boolean(process.env.FUCKDS_ROOT)` 分派：
+现在 `restartServer()` 按 `Boolean(process.env.CZDSAPI_ROOT)` 分派：
 
 - **源码模式**：保持原样交给 `server-ctl restart`（pid 文件、pm2/systemd 检测都还在用）。
 - **打包模式**：`restartPackaged()` 自己动手 ——
@@ -1413,8 +1413,8 @@ CRLF 下行尾的 `\` 变成字面量 `\` + `\r`，`apt-get` 收到一个叫 `ca
 #### 本地构建
 
 ```bash
-docker build -t fuckds .
-docker run -d -p 8787:8787 -e DEEPSEEK_USER_TOKEN=<token> -v fuckds-data:/app/data fuckds
+docker build -t cz-dsapi .
+docker run -d -p 8787:8787 -e DEEPSEEK_USER_TOKEN=<token> -v cz-dsapi-data:/app/data cz-dsapi
 ```
 
 不需要先跑 `npm run admin:build` 或 `npm run pow:build`，构建过程会做。
@@ -1501,7 +1501,7 @@ curl -s -H "Authorization: Bearer <token>" \
 | T8 | `admin` 的 token 校验用 `createEngine()` 真起引擎（可能拉起整只 Chromium） | 点一次"校验"可能启动浏览器 | 已有 `verifying` 串行限制；可复用主引擎的 `checkLogin` |
 | ~~T9~~ | ~~没有任何限流/防暴力破解（除了号池冷却）~~ | **已修复**：新增 `src/rate-limit.mjs` 的 IP 级令牌桶（默认 60/min 突发 + 1/s 补充），只对消耗上游额度的路径生效；`TRUST_PROXY` 默认关闭，不信任客户端伪造的 `X-Forwarded-For`；`maxBuckets` 上限防伪造 IP 撑爆内存。同轮还修了 SSRF（`src/net-guard.mjs`）与提示词段落注入（`src/prompt/sandbox.mjs`） | 见 §14.4 |
 | T10 | `browser` 引擎没有多账号 | 限流窗口一到就 429 | 可复用 `AccountPool`，轮换 token 后重建 context |
-| T11 | `fuckds.zip`（约 20MB）躺在仓库根目录 | 克隆变慢 | 移出仓库或用 Releases |
+| T11 | `cz-dsapi.zip`（约 20MB）躺在仓库根目录 | 克隆变慢 | 移出仓库或用 Releases |
 | T12 | PoW 的 NEON 汇编只在 arm64；其他平台走纯 Go | 无功能问题，但性能数字要注明平台 | 文档已注明。另：`POW_WORKERS` 原先到不了子进程（死配置），已在 §14.4 修好；多并发 solve 仍会各起 `NumCPU` 个 goroutine 互相抢核，改成共享原子计数器取块能再改善（未做） |
 | T14 | CI 只构建 `linux/amd64`，arm64（Apple Silicon / 部分 NAS）拉不到镜像 | 用 `--platform linux/amd64` 走模拟能跑，但慢 | 需要时给 `docker.yml` 加 `platforms: linux/amd64,linux/arm64` + `setup-qemu-action`，构建时间约翻倍 |
 | T15 | 镜像里的 Chromium 是固定 revision，与 `package.json` 的 playwright 版本绑死 | 升级 playwright 忘记重建镜像 → 运行时报"Executable doesn't exist" | CI 已经是 push 即重建，正常流程不会漏；手动改基镜像时注意 `playwright install` 用的是 `node_modules` 里那个版本 |
@@ -1595,7 +1595,7 @@ DNS 解析后的 IP 校验、连接期再校验（防 rebinding）、不跟随�
 
 | 检查项 | 为什么 |
 |---|---|
-| 入口怎么拿到 `ROOT` | `config.mjs` 用 `FUCKDS_ROOT`（打包态）或 `src/` 的上一级（源码态）。新形态若目录布局不同，必须设 `FUCKDS_ROOT` |
+| 入口怎么拿到 `ROOT` | `config.mjs` 用 `CZDSAPI_ROOT`（打包态）或 `src/` 的上一级（源码态）。新形态若目录布局不同，必须设 `CZDSAPI_ROOT` |
 | 可写目录有哪几个 | 只有 `data/`（号池 + 日志）和 `.env`。只读文件系统要保证这两处可写，否则 `loadConfig` 的 `mkdirSync` 会崩 |
 | 引擎要满足什么前提 | `direct` 需要 `bin/ds-pow`；`browser` 需要 Chromium。缺任一项都靠 `UnconfiguredEngine` 兜底（服务能起、请求报 400），别写成立刻退出 |
 | 重启怎么实现 | 见 §14.7 末尾。`process.execPath` 是不是解释器，决定了能不能复用 `server-ctl.mjs` |

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# fuckds —— DeepSeek 网页版转 OpenAI / Anthropic 兼容 API
+# cz-dsapi —— DeepSeek 网页版转 OpenAI / Anthropic 兼容 API
 #
 # 三阶段构建，目的是让最终镜像**小且能真正跑浏览器**：
 #   1. web      : 编译 React 控制台（需要 devDependencies，不进最终镜像）

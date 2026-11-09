@@ -12,7 +12,7 @@ import App from './App.jsx';
 loadLocale(async () => zhCnLocale);
 setLocale('zh-cn').catch(() => {});
 
-const THEME_KEY = 'fuckds-admin-theme';
+const THEME_KEY = 'cz-dsapi-admin-theme';
 const savedTheme = localStorage.getItem(THEME_KEY) || 'auto';
 setTheme(savedTheme);
 

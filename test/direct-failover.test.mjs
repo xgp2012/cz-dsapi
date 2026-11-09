@@ -135,7 +135,7 @@ test('坏号 401：同一个请求内自动换到好号，并把坏号停用（�
 
   const state = { completionTokens: [], sessionSeq: 0 };
   const server = await startFakeDeepSeek(state);
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fuckds-failover-'));
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cz-dsapi-failover-'));
   const config = makeConfig(`http://127.0.0.1:${server.address().port}`, dataDir);
   const engine = new DirectEngine({ config, logger });
 

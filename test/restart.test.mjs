@@ -22,8 +22,8 @@ const source = fs.readFileSync(
 test('重启会区分源码模式与打包模式', () => {
   assert.match(
     source,
-    /const packaged = Boolean\(process\.env\.FUCKDS_ROOT\)/,
-    '打包模式要能识别出来（FUCKDS_ROOT 是唯一可靠信号）',
+    /const packaged = Boolean\(process\.env\.CZDSAPI_ROOT\)/,
+    '打包模式要能识别出来（CZDSAPI_ROOT 是唯一可靠信号）',
   );
   assert.match(source, /if \(packaged\) \{\s*return restartPackaged\(\);/, '打包模式要走独立分支');
 });
@@ -36,7 +36,7 @@ test('打包模式不依赖 scripts/server-ctl.mjs（发行包里没有 scripts/
 });
 
 test('打包模式用「exe + 空参数」启动，不传脚本路径', () => {
-  // process.execPath 在 SEA 里就是 fuckds.exe，带参数会被当成用户参数
+  // process.execPath 在 SEA 里就是 cz-dsapi.exe，带参数会被当成用户参数
   assert.match(source, /spawn\(exe, \[\], \{/, '必须以空参数启动自身');
   assert.doesNotMatch(
     source.slice(source.indexOf('async function restartPackaged')),

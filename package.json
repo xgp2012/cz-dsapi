@@ -1,5 +1,5 @@
 {
-  "name": "fuckds",
+  "name": "cz-dsapi",
   "version": "0.1.0",
   "description": "把 chat.deepseek.com 网页对话包装成 OpenAI 兼容 API：Playwright 驱动浏览器，每条消息都是一次全新对话，上下文由 ## ROLE 段落拼接。",
   "private": true,

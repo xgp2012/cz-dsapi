@@ -6,7 +6,7 @@
  * - streamChat() 直接消费 /v1 的 SSE，用来在测试页里逐字显示。
  */
 
-const KEY_STORAGE = 'fuckds-admin-api-key';
+const KEY_STORAGE = 'cz-dsapi-admin-api-key';
 
 export class HttpError extends Error {
   constructor(message, status = 0, payload = null) {
@@ -61,7 +61,7 @@ export async function request(url, { method = 'GET', body, signal } = {}) {
     });
   } catch (err) {
     if (err?.name === 'AbortError') throw err;
-    throw new HttpError('无法连接服务，请确认 fuckds 正在运行', 0);
+    throw new HttpError('无法连接服务，请确认 cz-dsapi 正在运行', 0);
   }
 
   const text = await res.text();

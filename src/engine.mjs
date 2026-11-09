@@ -15,10 +15,10 @@ import { ApiError } from './errors.mjs';
 /**
  * 是否跑在打包后的 exe 里（SEA）。
  *
- * 打包入口会设置 FUCKDS_ROOT=exe 所在目录，源码运行时不会设置 —— 这是最可靠的判据。
+ * 打包入口会设置 CZDSAPI_ROOT=exe 所在目录，源码运行时不会设置 —— 这是最可靠的判据。
  * （不要用 npm_package_name：只有 `npm start` 才有，直接 `node src/index.mjs` 就没有。）
  */
-const isPackaged = () => Boolean(process.env.FUCKDS_ROOT);
+const isPackaged = () => Boolean(process.env.CZDSAPI_ROOT);
 
 /**
  * 登录态缺失时的提示。
@@ -36,9 +36,9 @@ function tokenHelp(config) {
     '',
     '  1) 环境变量（临时，最简单）',
     `     set ${envLine}`,
-    '     fuckds.exe',
+    '     cz-dsapi.exe',
     '',
-    '  2) 写进 .env 文件（推荐，放在 fuckds.exe 同目录）',
+    '  2) 写进 .env 文件（推荐，放在 cz-dsapi.exe 同目录）',
     `     ${envLine}`,
     '',
     '  3) 写入鉴权文件（支持多账号号池）',

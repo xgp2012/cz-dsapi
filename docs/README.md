@@ -21,7 +21,7 @@ npm run auth -- '<userToken>'
 npm start              # 前台跑；或用 npm run up 后台跑
 npm test               # 272 个用例（253 + 19 浏览器）；没有 Chromium 时浏览器用例会自动 skip
 npm run exe            # 打包成 Windows 单 exe → dist/win-x64/（目标机器零安装）
-docker build -t fuckds .   # 构建镜像（需要本地有 docker）
+docker build -t cz-dsapi .   # 构建镜像（需要本地有 docker）
 ```
 
 前端控制台需要单独构建一次：`npm run admin:install && npm run admin:build`，然后访问 `/admin`。
@@ -53,7 +53,7 @@ docker build -t fuckds .   # 构建镜像（需要本地有 docker）
 | Windows exe | `npm run exe` | **什么都不用装**（解压即用） | 不懂技术的 Windows 用户 |
 | Docker 镜像 | CI 自动推 `ghcr.io/xgp2012/cz-dsapi` | 只要 Docker | 服务器 / NAS |
 
-exe 产物里 `src/`、`node_modules/`、`ms-playwright/` 必须和 `fuckds.exe` 同目录 ——
+exe 产物里 `src/`、`node_modules/`、`ms-playwright/` 必须和 `cz-dsapi.exe` 同目录 ——
 SEA 内嵌代码只能按 CommonJS 执行，装不下 ESM 源码。原因与两个 playwright 坑见
 [§14.7 打包成 Windows 单 exe](./DEVELOPMENT.md#147-打包成-windows-单-exescriptsbuild-exemjs)。
 

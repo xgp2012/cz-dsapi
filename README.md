@@ -1,4 +1,4 @@
-# fuckds
+# cz-dsapi
 
 [**官方tg频道**](https://t.me/xinglingdefuckds)
 
@@ -101,15 +101,15 @@ npm run down      # 停止
 不需要装 Node、Go 或 Chromium —— 镜像里都带好了（含编译好的 Go PoW 求解器）。
 
 ```bash
-docker run -d --name fuckds \
+docker run -d --name cz-dsapi \
   -p 8787:8787 \
   -e DEEPSEEK_USER_TOKEN=<你的 userToken> \
-  -v fuckds-data:/app/data \
+  -v cz-dsapi-data:/app/data \
   --restart unless-stopped \
   ghcr.io/xgp2012/cz-dsapi:latest
 ```
 
-`-v fuckds-data:/app/data` 别省：号池和日志都在里面，不挂卷重建容器就丢了。
+`-v cz-dsapi-data:/app/data` 别省：号池和日志都在里面，不挂卷重建容器就丢了。
 
 也可以第一次**不传 token**，启动后打开 <http://127.0.0.1:8787/admin/>，
 控制台会自动跳到「账号」页引导你粘贴 —— 和本地跑完全一样的流程。
@@ -121,13 +121,13 @@ docker run -d --name fuckds \
 docker run -d -p 8787:8787 \
   -e DEEPSEEK_USER_TOKEN=<token> \
   -e API_KEY=<自己设一个> \
-  -v fuckds-data:/app/data \
+  -v cz-dsapi-data:/app/data \
   ghcr.io/xgp2012/cz-dsapi:latest
 
 # 切到浏览器引擎（镜像里已装 chromium-headless-shell）
 docker run -d -p 8787:8787 -e ENGINE=browser \
   -e DEEPSEEK_USER_TOKEN=<token> \
-  -v fuckds-data:/app/data \
+  -v cz-dsapi-data:/app/data \
   ghcr.io/xgp2012/cz-dsapi:latest
 ```
 
@@ -138,8 +138,8 @@ docker run -d -p 8787:8787 -e ENGINE=browser \
 <summary>自己构建镜像</summary>
 
 ```bash
-docker build -t fuckds .
-docker run -d -p 8787:8787 -e DEEPSEEK_USER_TOKEN=<token> -v fuckds-data:/app/data fuckds
+docker build -t cz-dsapi .
+docker run -d -p 8787:8787 -e DEEPSEEK_USER_TOKEN=<token> -v cz-dsapi-data:/app/data cz-dsapi
 ```
 
 Dockerfile 是三阶段的（控制台 → Go 求解器 → 运行时），前两阶段的工具链不进最终镜像。
@@ -504,7 +504,7 @@ npm run auth -- --list      # 查看号池（token 打码）
 | `POST /admin/api/restart` | 调 `server-ctl restart` 重启服务 |
 
 > 静态页面本身公开，`/admin/api/*` 才鉴权。浏览器端在首次 401 时弹出输入框，
-> key 保存在 localStorage（`fuckds-admin-api-key`），右上角钥匙图标可修改 / 清除。
+> key 保存在 localStorage（`cz-dsapi-admin-api-key`），右上角钥匙图标可修改 / 清除。
 
 思考开关：默认开（`DEEPSEEK_THINKING=always`），请求体传 `"thinking": false` 可单次关闭；`auto` 按模型名，`never` 全关。
 

@@ -95,7 +95,7 @@ npm run pow:build
 npm run auth -- '<userToken>'
 npm run up
 # 以后打包发布：
-npm run package   # 生成 fuckds-optimized.zip
+npm run package   # 生成 cz-dsapi-optimized.zip
 ```
 
 ---
