@@ -2,6 +2,7 @@ import { loadConfig } from './config.mjs';
 import { createLogger } from './logger.mjs';
 import { createEngine } from './engine.mjs';
 import { createServer } from './server.mjs';
+import { createAccountMonitor } from './account-monitor.mjs';
 
 const config = loadConfig();
 const logger = createLogger(config.logLevel);
@@ -22,8 +23,27 @@ try {
 
 const server = createServer({ config, logger, web });
 
+/**
+ * 账号后台探活：让「token 失效 → 人工重新 auth + 重启」变成自动恢复。
+ * 引擎不支持（browser / 未配置）时会自己静默跳过，这里不需要分支。
+ */
+const monitor = createAccountMonitor({
+  engine: web,
+  config,
+  logger: logger.child('probe'),
+  onEvent: (event) => {
+    // 目前只落日志；留成回调是为了以后接 Telegram / 邮件告警时不用改探活逻辑
+    if (event.type === 'unavailable') {
+      logger.warn(`账号 #${event.index} 已不可用${event.authFailed ? '（登录态失效）' : ''}：${event.reason ?? ''}`);
+    } else if (event.type === 'recovered') {
+      logger.info(`账号 #${event.index} 已恢复可用`);
+    }
+  },
+});
+
 const shutdown = async (signal) => {
   logger.info(`收到 ${signal}，正在关闭…`);
+  monitor.stop();
   server.close();
   await web.close().catch(() => {});
   process.exit(0);
@@ -38,6 +58,9 @@ if (config.runtime.warmup) {
     .then(() => logger.info('浏览器和对话页已预热'))
     .catch((err) => logger.warn('预热失败（首次请求会重新启动）:', err.message));
 }
+
+// 探活只在有号、且引擎支持时才真正启动（内部自己判定）
+if (config.runtime.accountProbeIntervalMs > 0) monitor.start();
 
 server.listen(config.server.port, config.server.host, () => {
   const base = `http://${config.server.host === '0.0.0.0' ? '127.0.0.1' : config.server.host}:${config.server.port}`;
@@ -56,6 +79,9 @@ server.listen(config.server.port, config.server.host, () => {
   );
   logger.info(`  引擎       ${web.status().engine || 'browser'}`);
   logger.info(`  并发       ${config.runtime.concurrency}，单次超时 ${Math.round(config.runtime.requestTimeoutMs / 1000)}s`);
+  if (monitor.status().enabled) {
+    logger.info(`  账号探活   每 ${Math.round(config.runtime.accountProbeIntervalMs / 1000)}s 复检停用/冷却中的账号（失效自动恢复）`);
+  }
 
   if (!ready) {
     // 用醒目的分隔线，避免淹没在普通日志里。

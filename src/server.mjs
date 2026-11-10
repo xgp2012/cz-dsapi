@@ -81,6 +81,8 @@ export function createServer({ config, logger, web }) {
           // 这里是布尔值，语义更明确。
           hasToken: config.deepseek.tokens.length > 0,
           token: config.deepseek.tokens.length > 0,
+          // 账号探活的开关节奏，控制台据此显示"下次复检"提示；不支持时省略
+          probeIntervalMs: config.runtime.accountProbeIntervalMs ?? 0,
           version: 1,
         });
       }

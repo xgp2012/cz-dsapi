@@ -1129,6 +1129,7 @@ ApiError(status, message, {type, code, param})
 | 运行 | `CONCURRENCY`(1) `QUEUE_LIMIT`(64) `REQUEST_TIMEOUT_MS`(240s) `FIRST_TOKEN_TIMEOUT_MS`(90s) |
 | 时序 | `POLL_INTERVAL_MS`(60) `SETTLE_MS`(800) `SEND_INTERVAL_MS`(4000) `DIRECT_SEND_INTERVAL_MS`(0) `REASONING_HOLD_MS`(900) |
 | 限流 | `ACCOUNT_COOLDOWN_MS`(60s) `MAX_COOLDOWN_WAIT_MS`(5s) `RATE_LIMIT_BACKOFF_MS`(4s) |
+| 探活 | `ACCOUNT_PROBE_INTERVAL_MS`(10min；0=关闭；下限 60s) |
 | 上下文 | `MAX_PROMPT_CHARS`(100000) `MAX_ATTACHMENT_CHARS`(2000000) `OVERFLOW_TO_ATTACHMENT`(true) |
 | 捕获 | `BROWSER_CAPTURE`(true) `BROWSER_CAPTURE_WAIT_MS`(20000) |
 | 其它 | `WARMUP`(true) `IDLE_SHUTDOWN_MS`(15min) `SAVE_ARTIFACTS`(true) `DATA_DIR`(data) |
@@ -1799,7 +1800,9 @@ node --test --test-name-pattern="DSML" "test/*.test.mjs"
   sessionPool,    // 预建的会话 id
   inflight,       // 在途请求数，配合 MAX_INFLIGHT_PER_ACCOUNT 摊分
   cooldownUntil, limitedCount, errorCount, lastError,
-  authFailed, lastUsedAt, requests }
+  authFailed, lastUsedAt, requests,
+  probing, lastProbeAt, probeFailures, recovered,   // 后台探活（见 §6.6）
+}
 ```
 
 `pick()` 增加 `inflight`，**必须**配 `release(account)`（放在 `try/finally` 里），

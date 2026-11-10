@@ -32,6 +32,8 @@ export default function Accounts({ hasToken, onConfigured }) {
   const [verifyResults, setVerifyResults] = useState(null);
   const [pendingRestart, setPendingRestart] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  const [probing, setProbing] = useState(false);
+  const [probeResults, setProbeResults] = useState(null);
 
   // 是否处于"首次配置"状态：服务端说没有 token，且本地也确实没存过
   const needsSetup = hasToken === false && !(data?.savedCount > 0);
@@ -145,8 +147,36 @@ export default function Accounts({ hasToken, onConfigured }) {
     }
   };
 
+  /**
+   * 立即复检运行中的号池。
+   *
+   * 和上面「校验登录态」的区别：那个校验的是你刚粘进输入框的 token，
+   * 这个复检的是**进程里正跑着的账号**，用来验证「自动恢复」有没有生效。
+   */
+  const probe = async () => {
+    setProbing(true);
+    setProbeResults(null);
+    try {
+      const result = await adminApi('/accounts/probe', { method: 'POST' });
+      if (!result.probed) {
+        toast(result.message || '当前引擎不支持账号复检');
+        return;
+      }
+      setProbeResults(result.results ?? []);
+      await load();
+      const failed = (result.results ?? []).filter((item) => !item.ok).length;
+      toast(result.ok ? `${result.probed} 个账号复检通过` : `${result.probed} 个账号中 ${failed} 个未通过`);
+    } catch (err) {
+      await notify(err.message, '复检失败');
+    } finally {
+      setProbing(false);
+    }
+  };
+
   const runtime = data?.runtime ?? [];
   const saved = data?.saved ?? [];
+  const needsProbe = data?.needsProbe ?? 0;
+  const probeIntervalMs = data?.probeIntervalMs ?? 0;
 
   return (
     <div className="page">
@@ -298,7 +328,49 @@ export default function Accounts({ hasToken, onConfigured }) {
       <Card
         title={`运行中的号池（${runtime.length} 个）`}
         subtitle={data?.savedAt ? `上次保存：${new Date(data.savedAt).toLocaleString('zh-CN', { hour12: false })}` : null}
+        actions={
+          runtime.length ? (
+            <Btn variant="tonal" icon="monitor_heart" loading={probing} onClick={probe}>
+              立即复检
+            </Btn>
+          ) : null
+        }
       >
+        {runtime.length && probeIntervalMs > 0 ? (
+          <Banner tone={needsProbe > 0 ? 'warn' : 'info'} icon="autorenew">
+            {needsProbe > 0
+              ? `有 ${needsProbe} 个账号处于停用 / 冷却状态。后台每 ${Math.round(probeIntervalMs / 60000)} 分钟会自动复检一个，通过就自动恢复；也可以点右上角「立即复检」马上验证。`
+              : `后台每 ${Math.round(probeIntervalMs / 60000)} 分钟自动复检停用 / 冷却中的账号，通过就自动恢复，无需重启。`}
+          </Banner>
+        ) : null}
+
+        {probeResults ? (
+          <div className="table-wrap" style={{ marginBottom: 12 }}>
+            <table className="data">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>复检结果</th>
+                  <th>说明</th>
+                  <th>耗时</th>
+                </tr>
+              </thead>
+              <tbody>
+                {probeResults.map((item) => (
+                  <tr key={item.index}>
+                    <td className="numeric">{item.index}</td>
+                    <td>
+                      {item.ok ? <Chip tone="ok">通过</Chip> : <Chip tone="error">失败</Chip>}
+                    </td>
+                    <td className="muted">{item.detail || '—'}</td>
+                    <td className="numeric">{item.ms != null ? formatMs(item.ms) : '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+
         {runtime.length ? (
           <div className="table-wrap">
             <table className="data">
@@ -311,6 +383,8 @@ export default function Accounts({ hasToken, onConfigured }) {
                   <th>限流次数</th>
                   <th>错误数</th>
                   <th>冷却</th>
+                  <th>已自动恢复</th>
+                  <th title="后台探活累计失败次数；成功一次清零">探活失败</th>
                   <th>最近错误</th>
                 </tr>
               </thead>
@@ -320,8 +394,12 @@ export default function Accounts({ hasToken, onConfigured }) {
                     <td className="numeric">{account.index}</td>
                     <td className="mono">{account.token}</td>
                     <td>
-                      {account.authFailed ? (
-                        <Chip tone="error">登录态失效</Chip>
+                      {account.probing ? (
+                        <Chip tone="info">复检中</Chip>
+                      ) : account.authFailed ? (
+                        <Chip tone="error" title="后台探活会定时复检；token 真的换了才会恢复">
+                          登录态失效
+                        </Chip>
                       ) : account.available ? (
                         <Chip tone="ok">可用</Chip>
                       ) : (
@@ -332,6 +410,8 @@ export default function Accounts({ hasToken, onConfigured }) {
                     <td className="numeric">{account.limited}</td>
                     <td className="numeric">{account.errors}</td>
                     <td className="numeric">{account.cooldownMs ? formatMs(account.cooldownMs) : '—'}</td>
+                    <td className="numeric">{account.recovered ? `${account.recovered} 次` : '—'}</td>
+                    <td className="numeric">{account.probeFailures ? account.probeFailures : '—'}</td>
                     <td className="muted">{account.lastError || '—'}</td>
                   </tr>
                 ))}

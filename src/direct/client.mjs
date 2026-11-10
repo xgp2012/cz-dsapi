@@ -170,6 +170,66 @@ export class DirectEngine {
   }
 
   /* ------------------------------------------------------------------ *
+   * 后台探活
+   * ------------------------------------------------------------------ */
+
+  /**
+   * 探活一个账号：用**尽可能便宜**的方式确认它还能不能干活。
+   *
+   * 设计取舍（为什么不是「发一条最短消息」）：
+   *   - 发消息会消耗账号的「窗口内条数」额度，探活本身就成了限流的来源；
+   *   - 建会话 + 解 PoW 对「登录态是否有效」是零信息量的，纯浪费首字延迟；
+   *   - 因此这里走到「预建会话」为止，拿到的 PoW 会**留进池子**给真实请求用，
+   *     探活不额外消耗任何额度，只是顺带把预热也做了。
+   *
+   * 账号如果靠真实请求自己就恢复了（checkLogin 都省了），
+   * 那是 `chat()` 的 markHealthy 负责的，这里只管「已经歇着的号」。
+   *
+   * 返回 { ok, kind, detail }，kind 用于调用方决定是否恢复账号：
+   *   ok       探活成功，可以恢复
+   *   limited  被限流：token 有效，但此刻没额度 —— **不能**延长停用
+   *   unknown  网络抖动 / 上游 5xx —— **不能**延长停用
+   *   auth     token 确实失效了 —— 维持停用
+   */
+  async probe(account) {
+    if (!account) throw new Error('probe: 缺少账号');
+    if (this.closed) return { ok: false, kind: 'unknown', detail: '引擎已关闭' };
+    this.pool.beginProbe(account);
+    const startedAt = Date.now();
+    try {
+      // 走到「预建会话」为止就够判定登录态了，而且这一步顺带把预热做了。
+      // 每个探活只做一件事：会话和 PoW 各认一条路，避免一次探活撞两次风控。
+      //
+      // 注意必须 await #powHeader：它返回时已经 #prefetchPow 把池子补回去了，
+      // 所以探活得到的 PoW 是**留给真实请求用**的，不是消耗。
+      const warm = await this.#prewarmSession(account, { wait: true });
+      this.pool.endProbe(account);
+      const revived = this.pool.markProbeSuccess(account);
+      const ms = Date.now() - startedAt;
+      if (revived) {
+        this.log.info(
+          `账号 #${account.index + 1} 探活通过，已自动恢复（累计恢复 ${account.recovered} 次，用时 ${ms}ms）`,
+        );
+      } else {
+        this.log.debug(`账号 #${account.index + 1} 探活通过（原本健康，用时 ${ms}ms）`);
+      }
+      return { ok: true, kind: 'ok', detail: '探活通过', ms, warm };
+    } catch (err) {
+      this.pool.endProbe(account);
+      const kind = classifyProbeFailure(err);
+      const detail = err?.message || String(err);
+      // 只有「确定是登录态问题」才把账号钉死在停用状态。
+      // 反例：探活撞上限流就续期冷却，会让恢复永远追不上冷却。
+      if (kind === 'auth') {
+        this.pool.markUnavailable(account, AUTH_INVALID_COOLDOWN_MS, '探活：登录态失效', { authFailed: true });
+      }
+      const failures = this.pool.markProbeFailure(account, `探活失败：${detail}`);
+      this.log.warn(`账号 #${account.index + 1} 探活失败（${kind}，连续 ${failures} 次）：${detail}`);
+      return { ok: false, kind, detail, ms: Date.now() - startedAt };
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
    * 请求
    * ------------------------------------------------------------------ */
 
@@ -647,14 +707,31 @@ export class DirectEngine {
     return { id, warm };
   }
 
-  #prewarmSession(account) {
-    if (this.closed || account.sessionPool.length) return;
+  /**
+   * 预建一个会话。
+   *
+   * 默认是「发射后不管」：调用方正在跑生成，不想它等这个 RTT。
+   * 探活需要**结果**（并且要拿到真实错误），所以支持 { wait: true } 同步等待。
+   * 会复用池里已有的会话，避免探活把一个好会话浪费掉。
+   */
+  #prewarmSession(account, { wait = false } = {}) {
+    if (this.closed) return wait ? Promise.resolve(null) : undefined;
+    if (account.sessionPool.length) {
+      return wait ? Promise.resolve(account.sessionPool[account.sessionPool.length - 1]) : undefined;
+    }
+    const create = () =>
+      this.#createSession(account).then((id) => {
+        if (!this.closed) account.sessionPool.push(id);
+        return id;
+      });
+
+    if (wait) return create();
+
     setTimeout(() => {
       if (this.closed || account.sessionPool.length) return;
-      this.#createSession(account)
-        .then((id) => account.sessionPool.push(id))
-        .catch(() => {});
+      create().catch(() => {});
     }, 0).unref?.();
+    return undefined;
   }
 
   async #createSession(account, signal) {
@@ -801,4 +878,26 @@ async function readJsonSafely(res) {
   } catch {
     return {};
   }
+}
+
+/**
+ * 给探活失败分级。
+ *
+ * 分级的意义在于「能不能据此延长停用」：
+ *   auth    token 确实失效（401/403 / AuthExpiredError）→ 维持停用
+ *   limited 额度用完（RateLimitError）→ token 有效，**不延长**
+ *   unknown 网络 / 上游 5xx / PoW 抖动 → **不延长**
+ *
+ * 把后两类判成 auth 是很危险的：一次网络抖动就能把一个好号钉死 24 小时，
+ * 而这正是探活本身要解决的问题，不能在探活里再造一个。
+ */
+export function classifyProbeFailure(err) {
+  if (err instanceof AuthExpiredError) return 'auth';
+  if (err instanceof RateLimitError) return 'limited';
+  const status = err?.status;
+  if (status === 401 || status === 403) return 'auth';
+  if (status === 429) return 'limited';
+  if (err?.code === 'deepseek_auth_required') return 'auth';
+  if (err?.code === 'deepseek_rate_limited') return 'limited';
+  return 'unknown';
 }

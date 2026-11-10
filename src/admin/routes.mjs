@@ -41,6 +41,13 @@ const ENV_SCHEMA = [
   { key: 'HOST', label: '监听地址', type: 'text', help: '改完重启才生效，建议保持 127.0.0.1' },
   { key: 'PORT', label: '监听端口', type: 'number', min: 1, max: 65535, help: '改完重启才生效' },
   { key: 'API_KEY', label: 'API Key', type: 'password', help: '设置后 API 和后台接口都会要求鉴权，留空表示不鉴权' },
+  {
+    key: 'ACCOUNT_PROBE_INTERVAL_MS',
+    label: '账号探活间隔（毫秒）',
+    type: 'number',
+    min: 60000,
+    help: '每隔多久复检一个停用/冷却中的账号；探活通过就自动恢复。0 = 关闭',
+  },
 ];
 
 const STATIC_MIME = {
@@ -76,6 +83,8 @@ export function createAdminHandler({ config, logger, web, server }) {
 
   /** 同一时间只跑一批 token 校验，避免把账号打爆 */
   let verifying = false;
+  /** 同一时间只跑一批号池复检（探活），理由同上 */
+  let probeRunning = false;
 
   /** @returns {Promise<boolean>} 是否已经处理（false 交给上层 404） */
   return async function handleAdmin(req, res, url) {
@@ -121,6 +130,35 @@ export function createAdminHandler({ config, logger, web, server }) {
     if (route === 'POST /admin/api/accounts/verify') {
       const body = await readJsonBody(req, 2 * 1024 * 1024);
       return sendJson(res, 200, await verifyTokens(body.tokens));
+    }
+
+    /**
+     * 立即复检运行中的号池（不创建新引擎，直接用当前进程里的账号）。
+     * 和 accounts/verify 的区别：那个校验的是「你刚粘进来的 token」，
+     * 这个复检的是「进程里正跑着的账号」，用来验证自动恢复有没有生效。
+     */
+    if (route === 'POST /admin/api/accounts/probe') {
+      if (probeRunning) throw new ApiError(409, '已有复检任务在进行，请稍后再试');
+      probeRunning = true;
+      try {
+        const startedAt = Date.now();
+        const results = [];
+        const candidates = web.pool?.probeCandidates?.({ includeHealthy: true }) ?? [];
+        for (const account of candidates) {
+          results.push({ index: account.index + 1, ...(await web.probe(account)) });
+        }
+        return sendJson(res, 200, {
+          ok: results.every((r) => r.ok),
+          probed: results.length,
+          ms: Date.now() - startedAt,
+          results,
+          message: results.length
+            ? undefined
+            : '当前引擎不支持账号复检（只有直连引擎有多账号号池）',
+        });
+      } finally {
+        probeRunning = false;
+      }
     }
 
     if (route === 'POST /admin/api/accounts') {
@@ -214,6 +252,9 @@ export function createAdminHandler({ config, logger, web, server }) {
       authFile,
       engine: status.engine,
       token: status.token,
+      probeIntervalMs: config.runtime.accountProbeIntervalMs ?? 0,
+      // 有几个号正躺在「停用/冷却」里，控制台可以据此提示"可点立即复检"
+      needsProbe: (status.accounts ?? []).filter((a) => a.authFailed || !a.available).length,
     };
   }
 
@@ -341,7 +382,7 @@ export function createAdminHandler({ config, logger, web, server }) {
       exists: fs.existsSync(envFile),
       schema: ENV_SCHEMA,
       values,
-      restartKeys: ['ENGINE', 'HOST', 'PORT', 'API_KEY', 'CONCURRENCY', 'MAX_PROMPT_CHARS', 'DEEPSEEK_THINKING', 'DEEPSEEK_SEARCH', 'LOG_LEVEL'],
+      restartKeys: ['ENGINE', 'HOST', 'PORT', 'API_KEY', 'CONCURRENCY', 'MAX_PROMPT_CHARS', 'DEEPSEEK_THINKING', 'DEEPSEEK_SEARCH', 'LOG_LEVEL', 'ACCOUNT_PROBE_INTERVAL_MS'],
       note: '修改会写回项目根目录的 .env，重启服务后生效。',
     };
   }
@@ -420,6 +461,7 @@ export function createAdminHandler({ config, logger, web, server }) {
       WARMUP: String(config.runtime.warmup),
       SAVE_ARTIFACTS: String(config.runtime.saveArtifacts),
       ACCOUNT_COOLDOWN_MS: String(config.runtime.accountCooldownMs),
+      ACCOUNT_PROBE_INTERVAL_MS: String(config.runtime.accountProbeIntervalMs ?? 0),
       HOST: config.server.host,
       PORT: String(config.server.port),
       API_KEY: config.server.apiKey ? '••••••••' : '',

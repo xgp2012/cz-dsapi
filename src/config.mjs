@@ -204,6 +204,10 @@ export function loadConfig(env = process.env) {
       browserCapture: bool(env.BROWSER_CAPTURE, true),
       // DOM 提前判定结束时，最多再等原始流收尾多久（毫秒），用来补齐被截断的尾部 token
       browserCaptureWaitMs: int(env.BROWSER_CAPTURE_WAIT_MS, 20_000),
+      // 账号后台探活：每隔多久复检一个「停用/冷却中」的账号。
+      // 成功就自动恢复（token 失效不再需要人工重启），0 = 关闭。
+      // 下限 60s：探活本身不能成为风控来源。
+      accountProbeIntervalMs: int(env.ACCOUNT_PROBE_INTERVAL_MS, 10 * 60_000),
     },
   };
 }

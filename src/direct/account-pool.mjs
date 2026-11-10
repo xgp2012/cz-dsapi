@@ -40,6 +40,15 @@ export class AccountPool {
       authFailed: false,
       lastUsedAt: 0,
       requests: 0,
+      /**
+       * 后台探活（见 src/account-monitor.mjs）：
+       * 账号被停用后不是死等 24h 或人工重启，而是由探活循环定期复检、
+       * 成功就自动恢复。这四个字段全部由探活循环写入。
+       */
+      probing: false,
+      lastProbeAt: 0,
+      recovered: 0,
+      probeFailures: 0,
     }));
     this.cursor = 0;
     if (this.accounts.length > 1) this.log.info(`账号池已加载 ${this.accounts.length} 个 token`);
@@ -131,6 +140,68 @@ export class AccountPool {
     account.lastError = null;
   }
 
+  /* ------------------------------------------------------------------ *
+   * 后台探活：给「手工恢复」补上自动路径
+   * ------------------------------------------------------------------ */
+
+  /**
+   * 挑出值得探活的账号。
+   *
+   * 只挑**当前不可能被请求选中**的号，这样探活永远不会和正常流量抢同一个号
+   * （抢了会白白多消耗一份限流额度，还可能把好号打成冷却）：
+   *   - 登录态失效停用的（这是主要的自愈目标，否则要等 24h 或人工重启）
+   *   - 冷却中的（探活成功说明它其实已经恢复，可以提前结束冷却）
+   *
+   * 已经健康的号不探活：它们由真实请求负责验证，多探一次纯浪费额度。
+   */
+  probeCandidates({ now = Date.now(), includeHealthy = false } = {}) {
+    return this.accounts.filter((account) => {
+      if (account.probing) return false;
+      if (this.maxInflightPerAccount > 0 && account.inflight >= this.maxInflightPerAccount) return false;
+      const needsProbe = account.authFailed || account.cooldownUntil > now;
+      return includeHealthy || needsProbe;
+    });
+  }
+
+  /** 标记探活开始，防止同一账号被两轮探活同时抓走 */
+  beginProbe(account, now = Date.now()) {
+    account.probing = true;
+    account.lastProbeAt = now;
+  }
+
+  endProbe(account) {
+    account.probing = false;
+  }
+
+  /**
+   * 探活成功：账号从停用/冷却里恢复。
+   * 复用 markHealthy 的语义（清冷却、清 authFailed），并把这次恢复记在账号上，
+   * 便于 /admin 与日志回答「这个号是不是自己恢复的」。
+   */
+  markProbeSuccess(account) {
+    const wasFailed = account.authFailed || account.cooldownUntil > Date.now();
+    this.markHealthy(account);
+    account.probeFailures = 0;
+    if (wasFailed) {
+      account.recovered += 1;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * 探活失败：只累计次数，**不动冷却与 authFailed**。
+   *
+   * 失败要分级，不能一律判死：限流（说明 token 有效，只是此刻额度用完）
+   * 和网络抖动都不该延长停用，否则一次探活抖动就能把好号永久锁在冷却里。
+   * 具体的分级判定在 DirectEngine.probe() 里做，这里只负责记账。
+   */
+  markProbeFailure(account, reason) {
+    account.probeFailures += 1;
+    if (reason) account.lastError = reason;
+    return account.probeFailures;
+  }
+
   status() {
     const now = Date.now();
     return this.accounts.map((a) => ({
@@ -146,6 +217,10 @@ export class AccountPool {
       inflight: a.inflight,
       powReady: a.powPool.length,
       sessionsReady: a.sessionPool.length,
+      probing: a.probing,
+      lastProbeAt: a.lastProbeAt || null,
+      probeFailures: a.probeFailures,
+      recovered: a.recovered,
     }));
   }
 
