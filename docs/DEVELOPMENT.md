@@ -14,7 +14,7 @@
 5. [请求全链路（OpenAI / Anthropic）](#5-请求全链路openai--anthropic)
    - [5.4 鉴权与连接](#54-鉴权与连接) · [5.5 入口限流（`src/rate-limit.mjs`）](#55-入口限流srcrate-limitmjs) · [5.6 图片下载与 SSRF 防护（`src/net-guard.mjs`）](#56-图片下载与-ssrf-防护srcnet-guardmjs)
 6. [引擎层：两个实现、一个隐式契约](#6-引擎层两个实现一个隐式契约)
-   - [6.5 并发模型](#65-并发模型两条流水线)
+   - [6.5 并发模型](#65-并发模型两条流水线) · [6.6 账号后台探活](#66-账号后台探活srcaccount-monitormjs)
 7. [上游协议细节](#7-上游协议细节)
 8. [Prompt 子系统](#8-prompt-子系统)
 9. [工具调用：DSML 协议与解析](#9-工具调用dsml-协议与解析)
@@ -101,6 +101,7 @@ src/util.mjs             contentToText / estimateTokens / parseEnvText / resolve
 src/auth.mjs             userToken 归一化、读写 data/auth.json、打码
 src/net-guard.mjs        SSRF 防护：URL 白名单 / 私网段判定 / 连接期 IP 校验 / 安全下载（不跟随重定向）
 src/rate-limit.mjs       入口限流的 IP 令牌桶 + clientIp（可信代理判定）
+src/account-monitor.mjs  账号后台探活：定时复检停用/冷却中的号，通过就自动恢复（见 §6.6）
 ```
 
 **交付与 CI（不进 src/，但改发布流程时必看）**：
@@ -652,6 +653,102 @@ Go/PoW 侧：`POW_WORKERS` 现在能真正下发到 `ds-pow` 子进程了（之�
 高并发时把它调小反而更好——N 个并发求解各起 `NumCPU` 个 goroutine 会互相抢核。
 把 `SolvePowWorkers` 换成共享原子计数器取块能进一步改善（**尚未实现**）。
 
+### 6.6 账号后台探活（`src/account-monitor.mjs`）
+
+**要解决的问题**：账号被判登录态失效后，`client.mjs` 会 `markUnavailable(…, AUTH_INVALID_COOLDOWN_MS=24h, authFailed)`。
+在此之前，恢复路径只有两条，且**都要人**：
+
+1. 等 24 小时停用期自然结束（而 token 过期根本不会自己恢复，等够 24h 也一样）；
+2. 手动重跑 `npm run auth` + 重启进程。
+
+号池全失效时 `pick()` 返回 `null` → `allAuthFailed()` → 抛 503「请重新 auth」，服务处于**不可用且不自愈**的状态。
+
+探活循环补上第三条：**自动恢复**。
+
+#### 一轮探活做什么
+
+```
+每 ACCOUNT_PROBE_INTERVAL_MS（默认 10min）
+  └─ pool.probeCandidates()           只挑「反正选不到」的号
+       └─ 取 candidates[0]            ★ 单轮只探一个
+            └─ engine.probe(account)
+                 ├─ #prewarmSession({ wait: true })   走到「建会话」为止就够判定登录态
+                 └─ 成功 → pool.markProbeSuccess()     自动恢复
+                    失败 → classifyProbeFailure()  分级后再决定要不要续期停用
+```
+
+`#prewarmSession({ wait: true })` 是**同步等待**的版本（`wait` 缺省时是"发射后不管"，
+因为真实请求路径不想等这个 RTT）。探活需要拿到真实错误，所以必须等。
+
+#### 为什么只探到「建会话」为止
+
+这是刻意的成本取舍，三个候选方案都否掉了：
+
+| 方案 | 否掉的原因 |
+|---|---|
+| 发一条最短消息（`admin/verifyOne` 的做法） | 消耗账号的「窗口内条数」额度 —— 探活自己就成了限流来源 |
+| 建会话 + 解 PoW | PoW 对「登录态是否有效」零信息量，白花 20–30ms |
+| **只建会话**（采用） | 已能区分 401/403 与正常，且顺带把会话池预热了 |
+
+探活**不消耗消息额度**，所以它有理由跑得比任何"发消息"的方案更频繁。
+这也是它与 §12.1 的 `accounts/verify` 的本质区别：那个校验的是"你刚粘进来的 token"，这个复检的是"进程里正跑着的账号"。
+
+#### probeCandidates：只挑选不到的号
+
+```js
+const needsProbe = account.authFailed || account.cooldownUntil > now;
+return includeHealthy || needsProbe;
+```
+
+外加两条排除：`account.probing`（防止两轮探活抓同一个号）、
+`inflight >= maxInflightPerAccount`（在途打满的号不抢）。
+
+健康的号**不在**候选里：它们由真实请求负责验证（`chat()` 成功就 `markHealthy`），
+多探一次纯属浪费。这个选择的直接好处是探活**永远不会和正常流量抢同一个账号**。
+
+#### 失败分级（`classifyProbeFailure`）——本节最重要的一条
+
+```js
+auth    → AuthExpiredError / 401 / 403 / code=deepseek_auth_required
+limited → RateLimitError / 429 / code=deepseek_rate_limited
+unknown → TimeoutError / 上游 5xx / ECONNREFUSED / 其它
+```
+
+**只有 `auth` 才 `markUnavailable(24h, authFailed)`；`limited` 和 `unknown` 一律只记账、不延长停用。**
+
+这条规则不能放宽。反例是现成的：探活撞上一次限流（`limited`）就续期冷却，
+会让"恢复"永远追不上"冷却"——每次快到期时探一次、撞限流、再续 60s，账号永久锁死。
+同样，一次网络抖动判成 `auth` 就能把好号钉死 24 小时，而**探活本身存在的意义就是消灭这种误判**，
+绝不能在探活里再造一个。
+
+> 已知的保守边界：上游返回 `创建会话失败：INVALID_TOKEN` 时**不带 401/403 状态码**，
+> 因此被归到 `unknown` 而不是 `auth`。这是刻意的——宁可让真失效的号多探几轮，
+> 也不让分类器靠文案匹配去猜（文案随上游改版而变，误判代价是锁死好号）。
+> 要放宽就改 `classifyProbeFailure`，别在调用点加特判。
+
+#### 工程约束（改动时别破坏）
+
+- **单轮只探一个号**：一批全探等于把探活做成一次风控事件；
+- **`timer.unref()`**：不阻止进程退出，`npm run down` / 优雅关闭不会被定时器挂住；
+- **引擎不支持就静默失效**：`supported()` 检查 `engine.probe` + `engine.pool.probeCandidates`，
+  browser 引擎与 `UnconfiguredEngine` 自动跳过，**调用方不需要任何特判**。新增引擎时要么实现
+  `probe()`，要么什么都不做（不要抛错）；
+- **只在状态变化时报告**：`reportChanges()` 对比前后快照，避免每轮刷日志；
+- `ACCOUNT_PROBE_INTERVAL_MS=0` 关闭；下限 60s（`MIN_PROBE_INTERVAL_MS`）。
+
+#### 观测点
+
+| 位置 | 能看到什么 |
+|---|---|
+| 日志 `账号 #N 探活通过，已自动恢复` | 恢复事件（info） |
+| 日志 `账号 #N 探活失败（kind，连续 N 次）` | 失败事件（warn），带分级结果 |
+| `AccountPool.status()` 的 `probing` / `lastProbeAt` / `probeFailures` / `recovered` | 控制台「已自动恢复」「探活失败」两列 |
+| `POST /admin/api/accounts/probe` | 立即复检运行中的号池（控制台「立即复检」按钮） |
+| `monitor.status()` | 开关状态、间隔、轮次、探活次数、恢复次数 |
+
+> `markProbeFailure()` 返回"连续失败次数"，但探活成功会把它清零 —— 它衡量的是
+> **当前这段坏运气有多长**，不是历史总数。历史总数没有意义（token 换了就归零）。
+
 ---
 
 ## 7. 上游协议细节
@@ -1095,7 +1192,8 @@ ApiError(status, message, {type, code, param})
 | GET | `/admin/api/overview` | 进程 / 引擎 / 号池 / 配置 / 文件路径 |
 | GET | `/admin/api/accounts` | 运行中号池 + 已保存 token（打码） |
 | POST | `/admin/api/accounts` | `{tokens, mode: append/replace}` → 写 `data/auth.json` |
-| POST | `/admin/api/accounts/verify` | 逐条校验（**会真的发一条最短消息**）；同一时间只允许一批 |
+| POST | `/admin/api/accounts/verify` | 逐条校验**刚粘贴的 token**（**会真的发一条最短消息**）；同一时间只允许一批 |
+| POST | `/admin/api/accounts/probe` | 立即复检**运行中的号池**（不消耗消息额度，见 §6.6）；`probeRunning` 串行；返回 `{ok, probed, ms, results}` |
 | POST | `/admin/api/accounts/remove` | `{index}`（1 起）；不允许删到空 |
 | GET/PUT | `/admin/api/config` | 读写项目根 `.env`（`ENV_SCHEMA` 白名单 + 逐项校验） |
 | GET | `/admin/api/logs?lines=` | 读 `data/server.log` 尾部（最多 512KB，clamp 50–5000） |
@@ -1150,6 +1248,7 @@ ApiError(status, message, {type, code, param})
 | 浏览器驱动 | `driver.test.mjs`、`serializer.test.mjs`、`stream-capture.test.mjs` | Playwright + `test/helpers/fake-deepseek.mjs` |
 | 直连故障切换 | `direct-failover.test.mjs` | 假 DeepSeek + **真实 `bin/ds-pow`** |
 | 直连 PoW 池 | `pow-cache.test.mjs` | 纯函数部分无依赖；「池行为」两条起**本地假上游 + 真实 `bin/ds-pow`**（黑盒验证过期件丢弃与预解复用） |
+| 账号探活 | `account-probe.test.mjs` | **无网络**：只测 `AccountPool` 的候选/恢复语义与 `classifyProbeFailure` 分级，不真的探上游（见 §6.6） |
 | 进程与配置 | `setup.test.mjs`（首次配置引导、`.env` 解析/写回）、`restart.test.mjs`（重启语义与 `packaged` 判定） | 无网络；`restart` 只断言判定逻辑，不真的重启进程 |
 | 端到端 | `scripts/smoke.mjs` | **真实账号**（会消耗额度） |
 | 端到端（离线） | `test/e2e/run.mjs` | 假上游 `test/e2e/fake-upstream.mjs` + 真起服务（独立进程走 `index.mjs`），**不消耗额度**；`npm test` **不**包含它，需手动 `node test/e2e/run.mjs [--only auth]` |
@@ -1201,7 +1300,7 @@ gh run list --repo <owner>/<repo>        # 看 CI 结果
 |---|---|---|
 | `go test ./...` | 通过 | PoW 哈希/求解全部通过 |
 | `npm run pow:build` | 生成 `bin/ds-pow`（Windows：`bin/ds-pow.exe`） | 与测试向量一致 |
-| `npm test` | **267 tests / 267 pass / 0 fail / 0 skipped**（轻量组）+ 浏览器组单独 **19 / 19 pass** | 合计 286。浏览器组需要本机有 Playwright 的 Chromium，缺失时自动 skip；两组由 `scripts/test.mjs` 分批跑（见 §14.1） |
+| `npm test` | **279 tests / 279 pass / 0 fail / 0 skipped**（轻量组）+ 浏览器组单独 **19 / 19 pass** | 合计 298。浏览器组需要本机有 Playwright 的 Chromium，缺失时自动 skip；两组由 `scripts/test.mjs` 分批跑（见 §14.1） |
 
 > 数字会随改动增长，别把它当基线卡死。真正的判据是 **0 fail / 0 skipped**；
 > 如果 `npm test` 报的数字明显少于上表，先确认是不是浏览器组被 skip 了。
@@ -1559,6 +1658,8 @@ curl -s -H "Authorization: Bearer <token>" \
 | T14 | CI 只构建 `linux/amd64`，arm64（Apple Silicon / 部分 NAS）拉不到镜像 | 用 `--platform linux/amd64` 走模拟能跑，但慢 | 需要时给 `docker.yml` 加 `platforms: linux/amd64,linux/arm64` + `setup-qemu-action`，构建时间约翻倍 |
 | T15 | 镜像里的 Chromium 是固定 revision，与 `package.json` 的 playwright 版本绑死 | 升级 playwright 忘记重建镜像 → 运行时报"Executable doesn't exist" | CI 已经是 push 即重建，正常流程不会漏；手动改基镜像时注意 `playwright install` 用的是 `node_modules` 里那个版本 |
 | T16 | 开发机没有 Docker，镜像只能靠 CI 构建后间接验证 | 无法本地 `docker run` 复现容器内问题 | 已在 §14.9 给出三步替代验证（静态检查 / CI 日志 / 读 Registry config）。有 Docker 的机器建议至少跑一次 `docker run` 验证 browser 引擎 |
+| T17 | 探活的 `INVALID_TOKEN` 判定偏保守（见 §6.6）：上游这个错误不带 401/403，被归到 `unknown`，不会立即判死 | 真失效的号会多探几轮才确认；`/healthz` 上看起来还是「冷却中」而不是「登录态失效」 | 想收紧就在 `classifyProbeFailure` 加文案匹配（`/INVALID_TOKEN/i`），但文案随上游改版而变，误判代价是把好号锁死 —— 当前选择宁可多探几轮 |
+| T18 | 探活只覆盖**直连引擎**；browser 引擎单 token、无号池，`supported()` 直接返回 false | browser 引擎下 token 失效仍然只能人工重启 | 要先给 browser 引擎做多账号（T10），探活才有意义；两者应该一起做 |
 
 ---
 
@@ -1715,7 +1816,7 @@ Docker 相关的两个必查项单独列一下，它们最容易漏：
 ### 17.1 日志
 
 - 格式：`HH:MM:SS.mmm LEVEL [scope] message` + 可选结构化对象（`LOG_LEVEL=debug` 才有大部分细节）；
-- scope 层级：`http` / `direct` / `web` / `admin` / `verify`；
+- scope 层级：`http` / `direct` / `web` / `admin` / `verify` / `probe`；
 - 后台日志文件：`data/server.log`（只有 `npm run up` 才重定向）。
 
 **必须认识的几条 warn**：
@@ -1730,6 +1831,9 @@ Docker 相关的两个必查项单独列一下，它们最容易漏：
 | `原始补全流未收完整且 DOM 未确认生成结束，拒绝返回` | 主动失败（不变量 I7） |
 | `DOM 读取中断，等待页面原始补全流收尾` | 救生艇启动，结果可能仍正常 |
 | `账号 #N 触发限流/不可用，停用 Xs` | 号池在换号 |
+| `账号 #N 探活通过，已自动恢复` | **好消息**：后台探活把一个停用号救回来了，不需要人工重启（§6.6） |
+| `账号 #N 探活失败（kind，连续 N 次）` | `kind=limited`/`unknown` 只是记账（不延长停用），不必处理；只有 `kind=auth` 意味着 token 真的失效，需要重新 auth |
+| `账号 #N 登录态失效（探活判定）` | 号池里该号的 token 已确认失效。其余账号继续服务；新 token 粘进控制台后，重启或等探活自动恢复 |
 | `PoW 被拒，重新获取后重试一次` | PoW 过期/复用，已自愈 |
 | `入口限流触发` `{ip, path}` | 客户端超过 `RATE_LIMIT_PER_MINUTE`。**若这里看到大量陌生 IP**，说明服务被扫了 —— 检查 `API_KEY` 是否为空、`HOST` 是否误设成 `0.0.0.0` |
 | `拒绝连接到内网地址` `{hostname, address}` | SSRF 防护生效，有请求试图让服务端访问内网。**这不是正常流量**，值得看一眼调用方是谁 |
@@ -1828,6 +1932,8 @@ node --test --test-name-pattern="DSML" "test/*.test.mjs"
 |---|---|---|
 | `POW_EXPIRY_SAFETY_MS` | 5_000 | `direct/client.mjs` |
 | `AUTH_INVALID_COOLDOWN_MS` | 24h | `direct/client.mjs` |
+| `MIN_PROBE_INTERVAL_MS`（探活下限） | 60_000 | `account-monitor.mjs` |
+| `DEFAULT_PROBE_INTERVAL_MS`（探活默认） | 600_000 | `account-monitor.mjs` |
 | `API_ERROR_MAX_RETRIES` / 间隔 | 3 / 500ms | `direct/client.mjs` |
 | `MAX_IMAGE_BYTES`（客户端校验 / 上传） | 10MB | `openai/images.mjs`、`direct/client.mjs` |
 | `MAX_ATTACHMENT_BYTES` | 20MB | `direct/client.mjs` |
