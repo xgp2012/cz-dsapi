@@ -8,7 +8,7 @@ import {
   buildUploadHeaders,
   padPowDuration,
   runColdStartSequence,
-  typingDelay,
+  typingDelayFor,
 } from './fingerprint.mjs';
 import { PowSolver } from './pow.mjs';
 import { applyPatch, collectText, createSseParser, createStreamState, createTextTracker } from './stream.mjs';
@@ -279,21 +279,26 @@ export class DirectEngine {
     // powHeader 必须是 let：40301 重试时要把它置空，逼下一轮重新 fetch+solve，
     // 否则会一直拿同一个失效 header 重试（历史 bug：日志里连续 3 次 INVALID_POW_RESPONSE）。
     let powHeader;
-    const [sessionId, initialPowHeader] = await Promise.all([
+    const [session, initialPow] = await Promise.all([
       this.#takeSession(account, signal),
       this.#powHeader(account),
     ]);
-    powHeader = initialPowHeader;
+    const sessionId = session.id;
+    powHeader = initialPow.header;
     const powMs = Date.now() - powStart;
     this.#prefetchPow(account);
 
     // 行为时序伪装：真浏览器不会「PoW 一解完就立刻发」。
-    // 1) PoW 在 JS 里本就比 Go 慢，补足到合理区间；
-    // 2) 发送前再加一点「输入停顿」。
+    // 1) PoW 在 JS 里本就比 Go 慢，补足到合理区间 —— 起点用 powStart（请求入口）。
+    //    这里刻意**包含**建会话与 challenge 的真实网络耗时：那些 RTT 是真实发生的，
+    //    已经帮 pad 完成了一部分「耗时伪装」，用它们抵扣补齐时长并不损失伪装，
+    //    反而省掉一段纯等待。若改成只按 PoW 求解计时，网络快的机器会白垫 100ms+。
+    // 2) 发送前的「输入停顿」只在真的新建会话（语义上等于用户敲首条消息）时付全额，
+    //    复用预热会话时缩短到很小的抖动 —— 那条路径上「用户在打字」本就不成立。
     if (this.config.deepseek.humanTiming !== false) {
       const powPad = padPowDuration(powStart);
       if (powPad > 0) await sleep(powPad, signal);
-      await sleep(typingDelay(), signal);
+      await sleep(typingDelayFor({ warm: session.warm }), signal);
     }
 
     let powRetried = false;
@@ -319,7 +324,9 @@ export class DirectEngine {
         let header = powHeader;
         if (!header) {
           // 走到这里说明是 40301 重试：现场取一个新的 PoW。
-          header = await this.#powHeader(account);
+          // 重试路径不补 pad：伪装只针对「正常一轮」的 PoW 耗时特征，
+          // 重试本身已是异常路径，再垫延迟只会让用户多等。
+          header = (await this.#powHeader(account)).header;
           // 重试消耗掉了之前预解的那个，顺手再预解一个给后续请求。
           this.#prefetchPow(account);
         }
@@ -634,9 +641,10 @@ export class DirectEngine {
 
   async #takeSession(account, signal) {
     const pooled = account.sessionPool.pop();
+    const warm = Boolean(pooled);
     const id = pooled || (await this.#createSession(account, signal));
     this.#prewarmSession(account); // 本轮生成期间就把下一轮会话建好
-    return id;
+    return { id, warm };
   }
 
   #prewarmSession(account) {
@@ -687,7 +695,7 @@ export class DirectEngine {
   }
 
   /**
-   * PoW 是一次性的：取走就得重新解，所以在后台一直预解下一个。
+   * 取一个可用的 PoW header，返回 { header }。
    *
    * 预解结果带 expireAt：如果取用时剩余有效期不足 POW_EXPIRY_SAFETY_MS，
    * 说明 challenge 已过期/即将过期，服务端会拒收，直接丢弃并重新 fetch+solve。
@@ -718,9 +726,9 @@ export class DirectEngine {
     // 取走（或丢弃）后立刻补池：过期场景下这里的补池尤其重要，
     // 否则一次空闲就可能让后续每个请求都退化成现场 fetch+solve。
     this.#prefetchPow(account);
-    if (solved && powNotExpired(solved.expireAt)) return solved.header;
+    if (solved && powNotExpired(solved.expireAt)) return { header: solved.header };
     this.log.debug(`账号 #${account.index + 1} 没有可用的预解 PoW，现场获取`);
-    return (await this.#solveNew(account)).header;
+    return { header: (await this.#solveNew(account)).header };
   }
 
   #prefetchPow(account) {

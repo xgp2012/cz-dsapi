@@ -163,6 +163,9 @@ npm run package   # 生成 cz-dsapi-optimized.zip
 耗时特征更像机器，请自行权衡。本次改的是**已经开始流之后的
 每 token 成本**，两处都是随输出长度增长的二次开销：
 
+> 后来（第二轮之后）打字停顿已按场景分档：命中预热会话时缩短到
+> 20–90ms，冷路径保持 120–480ms。详见 `docs/DEVELOPMENT.md` §16.9。
+
 - **直连引擎**（`src/direct/client.mjs` + `src/direct/stream.mjs`）：
   原来每个上游补丁都要把全部 fragments filter + map + join 一遍，
   再和已发文本做 `startsWith`。新增 `createTextTracker`：同一对象

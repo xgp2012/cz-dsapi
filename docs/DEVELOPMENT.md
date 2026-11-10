@@ -1576,7 +1576,7 @@ DNS 解析后的 IP 校验、连接期再校验（防 rebinding）、不跟随�
 
 | 现象 | 可能位置 | 手段 |
 |---|---|---|
-| 首字慢 | PoW 补齐 + typingDelay（`humanTiming`）、建会话、DOM 导航 | `DEEPSEEK_HUMAN_TIMING=false`；direct 的会话/PoW 预取（`powPool`） |
+| 首字慢 | PoW 补齐 + typingDelay（`humanTiming`）、建会话、DOM 导航 | `DEEPSEEK_HUMAN_TIMING=false`；direct 的会话/PoW 预取（`powPool`）。注意 `typingDelayFor({warm})` 已按「是否命中预热会话」分档（见 §16.9） |
 | 长回答后期越来越慢 | 流式热路径 O(n²) | `createTextTracker`（direct）、`ToolMarkupStreamFilter` 的尾部窗口 + `#compact`（browser）——**已修，见 §10.2**；若复发先看是不是有人在整段扫描 |
 | 并发上不去 | ① 入口限流先挡了 ② `CONCURRENCY=1` ③ 号池只有 1 个号 ④ browser 的发送闸门 | ① 看 `429 local_rate_limited`，调 `RATE_LIMIT_PER_MINUTE` ②/④ **注意 browser 加页面不提高吞吐**（见 §6.5），吞吐由 `SEND_INTERVAL_MS` 决定 ③ direct 加 token 比调参有效（限流是"窗口内条数"） |
 | 多号时全压一个号 | `MAX_INFLIGHT_PER_ACCOUNT` 未设 | 设成 2~4，让请求摊开 |
@@ -1584,6 +1584,50 @@ DNS 解析后的 IP 校验、连接期再校验（防 rebinding）、不跟随�
 
 **定位方法**：`/healthz` 返回的 `status()` 里有 `busy` / `queued` / 每号 `inflight` / `powReady`，
 先看请求到底卡在哪个闸门，再去调参数。
+
+### 16.9 首字延迟（TTFT）：哪段能动、哪段别动
+
+direct 引擎从收到请求到首个 token，时间构成：
+
+```
+① 附件/图片上传（有才发生，串行阻塞）
+② 建会话 + 取 PoW（两者并行，≈ max 而非 sum）
+③ padPowDuration + typingDelay      ← 唯一可调的人为延迟
+④ 上游真正出首 token                ← 不可控
+```
+
+**① ② 已被并行化，③ 是唯一能靠改参数动的部分。** 但动之前必须理解补偿关系：
+
+**`padPowDuration` 的起点必须用请求入口（`powStart`），不能改成 PoW 求解时刻。**
+它的语义是把「PoW 总耗时」补到 120–520ms 窗口内。建会话与 challenge 的
+网络 RTT 是**真实发生的**，服务端看到的「challenge → completion」间隔本就
+包含它们，所以用它们抵扣补齐时长没有任何伪装损失。
+
+实测（会话 180ms + challenge RTT 190ms + 求解 25ms 的模拟链路）：
+
+| 起点 | 冷路径 pad 平均 |
+|---|---|
+| 请求入口（正确） | 19ms |
+| PoW 求解处（错误） | 117ms |
+
+改成求解时刻会让网络快的机器**每请求白垫约 97ms**。这不是优化，是负优化。
+已有 `test/fingerprint.test.mjs` 锁定这个行为，改回去会直接测试失败。
+
+**`typingDelay` 已按场景分档**（`typingDelayFor({warm})`）：
+
+| 场景 | 区间 | 依据 |
+|---|---|---|
+| 冷（新建会话） | 120–480ms | 语义等于「用户点开新对话敲首条消息」，前提成立 |
+| 热（命中 `sessionPool`） | 20–90ms | 该路径上「用户在打字」本就不成立，全额停顿换不来伪装收益 |
+
+热路径省约 **210ms**，冷路径不变。保留 20–90ms 而非 0，是因为零延迟比固定值更不自然。
+
+**不要做的**：不要为了快而缩短 PoW 求解区间或降低 `difficulty`。服务端会拒收
+（`INVALID_POW_RESPONSE` / `40301`），触发重试阶梯，净效果是变慢。
+
+**要更快只能显式关伪装**：`DEEPSEEK_HUMAN_TIMING=false` 会同时清掉 ③ 的两段，
+首字省 240–1000ms，代价是 PoW 只花 20–30ms 就发出 completion，特征更像机器。
+这是留给使用者的显式权衡，不要用“默认优化”的方式偷偷替他做。
 
 **不要动**：`pollIntervalMs`、`settleMs`、号池冷却/换号逻辑 —— 它们不是"冗余"，调小会直接增加截断/丢尾风险。
 `SPECIAL_TOKENS_HEADER` / `DEFAULT_RESERVE` / `DEFAULT_MIN_DIALOG_CHARS` 也不要为了"全绿"去改（见 §14.3）。

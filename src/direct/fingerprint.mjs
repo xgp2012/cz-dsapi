@@ -165,11 +165,33 @@ export function typingDelay() {
 }
 
 /**
+ * 输入停顿的「分场景」版本。
+ *
+ * 原实现每次请求都固定等 120–480ms，但这段延迟的语义是「用户在输入框打字」。
+ * 只有当本轮真的新建了会话（等价于用户点开一个新对话、敲入首条消息）时，
+ * 这个前提才成立；复用预热会话时，请求在语义上更接近「刷新后自动重发」，
+ * 硬加一段打字停顿既不能让画像更真实，又白白拖慢首字。
+ *
+ * warm=true（命中预热会话）时用更短的抖动区间：保留一点非零延迟，
+ * 避免出现「0 延迟」这种比固定值更不自然的特征；两侧都不产生 0。
+ */
+export function typingDelayFor({ warm = false } = {}) {
+  return warm ? jitter(20, 90) : typingDelay();
+}
+
+/**
  * PoW 求解耗时「伪装」。
  *
  * 真浏览器在 JS 里算 14.4 万次 SHA3 通常 150~800ms，而 Go 只要 20~30ms。
  * 一次 25ms 就完成的 PoW，在服务端看是明显的非 JS 环境特征。
  * 这里把总耗时补到随机区间内（只补不削）。
+ *
+ * startedAt 传 client.mjs 的 powStart（请求入口），**刻意包含**建会话与拉
+ * challenge 的真实网络耗时：那些 RTT 确实发生了，服务端看到的
+ * 「challenge → completion」间隔本来就该包含它们，所以用它抵扣补齐时长
+ * 不损失任何伪装，还能省掉一段纯等待。
+ * 反过来说，把起点挪到 PoW 求解处会让网络快的机器白垫 100ms+（实测冷路径
+ * 平均多等约 97ms），这不是优化而是负优化 —— 别再"顺手改回去"。
  */
 export function padPowDuration(startedAt, targetMin = 120, targetMax = 520) {
   const target = jitter(targetMin, targetMax);
