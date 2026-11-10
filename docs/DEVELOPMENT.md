@@ -743,6 +743,24 @@ header = base64(JSON({algorithm, challenge, salt, answer, signature, target_path
 同时 `config.direct.powBin` 会经过 `src/util.mjs#resolveExecutable`，原路径不存在时按 PATHEXT 再试 `.exe/.cmd/.bat`。
 所以即使你手动编出了不带扩展名的 `bin/ds-pow`，Node 的 `spawn` 也能找到它（不会再报 `spawn ... ENOENT`）；Linux/macOS 行为不变。
 
+#### PoW 是一次性的：池的生命周期
+
+每个 challenge 只能用一次，所以引擎在后台预解（`account.powPool`，上限 `POW_POOL_SIZE = 2`），
+`account.powPending` 记录在途求解。`#powHeader()` 的取用顺序：
+
+1. 从 `powPool` 里**扫描**出第一份没过期的（`powNotExpired`，留 `POW_EXPIRY_SAFETY_MS = 5s` 余量）；
+   过期件**直接丢弃**，不是"取一个再看" —— 空闲久了池里会全过期，只看第一个会导致
+   下次请求再丢一次、再重解一发，等于白解两发。
+2. 池空但 `powPending` 在途 → 复用它（并发请求不该各自解一次）。
+3. 都没有 → 现场 `fetchChallenge + solve`。
+4. **无论第 1~3 步走哪条，取用或丢弃之后都补池**。丢弃路径不补池这一条尤其致命：
+   一次空闲就能让后续每个请求都退化成现场求解，首字多花一个 RTT + 20–30ms。
+
+> `expire_at` 参与哈希前缀（`prefix = salt + "_" + expire_at + "_"`），所以**测试不能随意把
+> `expire_at` 改成"未来时间"来让预解件有效** —— 那会让官方测试向量（`answer=42`）无解，
+> 报 `pow: no solution within difficulty`。构造"预解件过期"的场景要往池里塞人造的 `expireAt`，
+> 别改上游返回的 challenge（见 `test/pow-cache.test.mjs`）。
+
 ---
 
 ## 8. Prompt 子系统
@@ -972,7 +990,34 @@ if (this.cutIndex >= 0) this.cutIndex -= drop;
 > 如果耗时随长度**平方**增长，说明某一层又在整段扫描了。
 
 **窗口大小不能随便调小**：`PROTOCOL_LOOKAHEAD` 必须大于 `holdBack`（48）+ 最长的半截标记
-（原生工具 token `<|...tool...|>` 正则里限 64+64，段标题最长约 26）。调小会让跨 chunk 的协议块漏进正文。
+（原生工具 token `<|...tool|>` 正则里限 64+64，段标题最长约 26）。调小会让跨 chunk 的协议块漏进正文。
+
+#### direct 侧的三处同源问题（`src/direct/stream.mjs`）
+
+`ToolMarkupStreamFilter` 是**协议层**的 O(n²)；direct 引擎的 patch 协议在**更底层**还有三处
+同源问题，它们叠加在同一帧路径上，任何一处复发都会让长回答后期明显变慢：
+
+| # | 位置 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | `appendToLast` | `fragment.content += text`：每帧把整段内容复制一遍 | 增量记进 `fragment._parts`，读取时由 `materializeFragment` 合并（幂等） |
+| 2 | `createTextTracker` | 为了判断"变没变"，每帧都要拼出全文再比 | 优先用 `_parts` 直接得到本批增量；快照替换/中间改写才回退全文比对 |
+| 3 | `createSseParser` | 逐帧 `slice` 剩余 buffer | 只拼接「残留半帧 + 新 chunk」，消费完立刻切掉 |
+
+实测（20000 帧）：
+
+```
+fragment 追加（200KB）：1122ms → 47ms
+SSE 解析   （508KB）： 111ms  → 53ms
+```
+
+**`_parts` 的约定必须守住**：它是内部字段，来自上游快照的 fragment 天然没有它（缺省即"无待合并增量"）。
+所以**任何读取 `fragment.content` 的地方都必须先 `materializeFragment(fragment)`**，
+或者直接走 `collectText(state, type)` —— 后者已经内置了合并。
+直接读 `f.content` 会在"增量还没合并"时读到旧值，**表现为丢字**（`client.mjs` 的追踪器回退分支
+就是这么踩过），`test/direct-stream.test.mjs` 有专门用例锁住。
+
+> 自检方法：改完跑 `test/direct-stream.test.mjs`，它覆盖了增量缓冲的幂等性、快照替换不丢字/不重发、
+> 中间改写回退到全文、超长单帧分块解析、`flush` 残帧五种情况。
 
 ### 10.3 流式补尾（`reconcileStreamedText`）
 
@@ -1098,12 +1143,15 @@ ApiError(status, message, {type, code, param})
 
 | 类型 | 文件 | 依赖 |
 |---|---|---|
-| 纯函数 | `tools / tool-text / prompt / overflow / images / pow-cache / direct-stream / account-pool / tool-args` | 无 |
+| 纯函数 | `tools / tool-text / prompt / overflow / images / direct-stream / account-pool / tool-args / fingerprint` | 无 |
 | 安全 | `sandbox`（段落注入）、`net-guard`（SSRF）、`rate-limit`（限流 / 可信代理）、`semaphore`（并发闸 + 取消） | 无（`net-guard` 会起一个本地 http server 验证"内网服务一次都没被打到"） |
 | 协议编排 | `server.test.mjs`、`anthropic.test.mjs` | 用 `fakeWeb()` 注入假引擎，**不联网** |
 | 浏览器驱动 | `driver.test.mjs`、`serializer.test.mjs`、`stream-capture.test.mjs` | Playwright + `test/helpers/fake-deepseek.mjs` |
 | 直连故障切换 | `direct-failover.test.mjs` | 假 DeepSeek + **真实 `bin/ds-pow`** |
+| 直连 PoW 池 | `pow-cache.test.mjs` | 纯函数部分无依赖；「池行为」两条起**本地假上游 + 真实 `bin/ds-pow`**（黑盒验证过期件丢弃与预解复用） |
+| 进程与配置 | `setup.test.mjs`（首次配置引导、`.env` 解析/写回）、`restart.test.mjs`（重启语义与 `packaged` 判定） | 无网络；`restart` 只断言判定逻辑，不真的重启进程 |
 | 端到端 | `scripts/smoke.mjs` | **真实账号**（会消耗额度） |
+| 端到端（离线） | `test/e2e/run.mjs` | 假上游 `test/e2e/fake-upstream.mjs` + 真起服务（独立进程走 `index.mjs`），**不消耗额度**；`npm test` **不**包含它，需手动 `node test/e2e/run.mjs [--only auth]` |
 
 `fakeWeb()` 只实现 `chat / uploadAttachments / status` 就够了 —— 但注意它的 `chat` 必须返回 `{ text, reasoning }`（字符串）。`chat-runner` 对非字符串做了兜底（返回空回答而不是 500），**不要**依赖这个兜底来掩盖引擎返回值写错。
 
@@ -1122,6 +1170,7 @@ ApiError(status, message, {type, code, param})
 npm install                 # 只装 playwright
 npm run pow:build           # 生成 bin/ds-pow（Windows 上是 bin/ds-pow.exe）
 npm test                    # 全部用例；没 Chromium 的用例会自动 skip
+node test/e2e/run.mjs       # 离线端到端：真起服务 + 假上游，不消耗额度（不在 npm test 里）
 npm run smoke               # 真实上游：非流式 / 流式 / 多轮 / 工具
 npm run smoke -- --only tools
 go test ./... && go test -bench=. -benchmem
@@ -1151,7 +1200,10 @@ gh run list --repo <owner>/<repo>        # 看 CI 结果
 |---|---|---|
 | `go test ./...` | 通过 | PoW 哈希/求解全部通过 |
 | `npm run pow:build` | 生成 `bin/ds-pow`（Windows：`bin/ds-pow.exe`） | 与测试向量一致 |
-| `npm test` | **272 tests / 272 pass / 0 fail / 0 skipped** | 含 24 个浏览器用例（需要本机有 Playwright 的 Chromium，缺失时自动 skip） |
+| `npm test` | **267 tests / 267 pass / 0 fail / 0 skipped**（轻量组）+ 浏览器组单独 **19 / 19 pass** | 合计 286。浏览器组需要本机有 Playwright 的 Chromium，缺失时自动 skip；两组由 `scripts/test.mjs` 分批跑（见 §14.1） |
+
+> 数字会随改动增长，别把它当基线卡死。真正的判据是 **0 fail / 0 skipped**；
+> 如果 `npm test` 报的数字明显少于上表，先确认是不是浏览器组被 skip 了。
 
 **Windows 上的 `.exe` 问题已修复**（原 T2 的 Windows 部分）：根因是 Node 的 `spawn` 只对"不带路径的命令名"
 按 PATHEXT 补扩展名，而这里给的是完整文件名；Go 的 `-o` 又不会自动加 `.exe`。现在两道保险：
@@ -1585,6 +1637,10 @@ DNS 解析后的 IP 校验、连接期再校验（防 rebinding）、不跟随�
 **定位方法**：`/healthz` 返回的 `status()` 里有 `busy` / `queued` / 每号 `inflight` / `powReady`，
 先看请求到底卡在哪个闸门，再去调参数。
 
+**不要动**：`pollIntervalMs`、`settleMs`、号池冷却/换号逻辑 —— 它们不是"冗余"，调小会直接增加截断/丢尾风险。
+`SPECIAL_TOKENS_HEADER` / `DEFAULT_RESERVE` / `DEFAULT_MIN_DIALOG_CHARS` 也不要为了"全绿"去改（见 §14.3）。
+`PROTOCOL_LOOKAHEAD` 同样不能随便调小（见 §10.2）。
+
 ### 16.9 首字延迟（TTFT）：哪段能动、哪段别动
 
 direct 引擎从收到请求到首个 token，时间构成：
@@ -1629,11 +1685,8 @@ direct 引擎从收到请求到首个 token，时间构成：
 首字省 240–1000ms，代价是 PoW 只花 20–30ms 就发出 completion，特征更像机器。
 这是留给使用者的显式权衡，不要用“默认优化”的方式偷偷替他做。
 
-**不要动**：`pollIntervalMs`、`settleMs`、号池冷却/换号逻辑 —— 它们不是"冗余"，调小会直接增加截断/丢尾风险。
-`SPECIAL_TOKENS_HEADER` / `DEFAULT_RESERVE` / `DEFAULT_MIN_DIALOG_CHARS` 也不要为了"全绿"去改（见 §14.3）。
-`PROTOCOL_LOOKAHEAD` 同样不能随便调小（见 §10.2）。
 
-### 16.9 改发布流程 / 加一种交付形态
+### 16.10 改发布流程 / 加一种交付形态
 
 现状是三种形态（源码 / Windows exe / Docker），共用同一份 `src/`。加新形态时按这个清单走：
 
@@ -1795,6 +1848,9 @@ node --test --test-name-pattern="DSML" "test/*.test.mjs"
 | 限流桶清理周期 / 过期阈值 | 5min / 10min | `rate-limit.mjs` |
 | SSRF：允许的协议 | `http:` / `https:` | `net-guard.mjs` |
 | `POW_POOL_SIZE`（每号预解 PoW 数） | 2 | `direct/client.mjs` |
+| PoW 补齐窗口（冷路径） | 120–520ms | `direct/fingerprint.mjs` |
+| `typingDelay` 冷路径（新建会话） | 120–480ms | `direct/fingerprint.mjs` |
+| `typingDelayFor({warm:true})` 热路径 | 20–90ms | `direct/fingerprint.mjs` |
 | SSE keep-alive 间隔 | 15_000 | `src/sse.mjs` |
 | 默认 PoW difficulty 兜底 | 144000 | `deepseek_pow.go` |
 | `cancelCheckMask` | 0x3FF（每 1024 次检查） | `deepseek_pow.go` |

@@ -5,11 +5,13 @@
 | 文档 | 内容 |
 |---|---|
 | [开发文档](./DEVELOPMENT.md) | 架构、模块职责、请求全链路、引擎契约、**并发模型**、上游协议、Prompt/工具调用、**安全加固**、错误与重试、测试、**Docker 镜像与 CI**、调试、技术债 |
+| [优化说明](../OPTIMIZATION.md) | 相对原包的两轮优化记录（体积/安全/去重/热路径/提示词），附实测数字 |
 | [环境变量样例](../.env.example) | 全部配置项与默认值 |
 | [Dockerfile](../Dockerfile) · [.dockerignore](../.dockerignore) · [workflow](../.github/workflows/docker.yml) | 交付形态的定义文件 |
 
-> 早先引用的 `OPTIMIZATION.md` 已不存在，其中的"不要动的地方"已并入
-> [开发文档 §14.5](./DEVELOPMENT.md#145-并发与性能本轮新增) 与 [§16.8 优化性能](./DEVELOPMENT.md#168-优化性能)。
+> `OPTIMIZATION.md` 是**历史优化记录**，记录"当时为什么这么改、实测是多少"；
+> 它是按轮次追加的，可能滞后于当前代码。**以 [开发文档](./DEVELOPMENT.md) 为准**，
+> 尤其是 §10.2（流式热路径）、§16.8（优化性能）、§16.9（首字延迟）三处。
 
 ## 3 分钟上手
 
@@ -19,7 +21,7 @@ npm run setup:browser  # 下载 Playwright 的 Chromium（browser 引擎与浏�
 npm run pow:build      # 编译 Go PoW 求解器 → bin/ds-pow（Windows 上是 bin/ds-pow.exe）
 npm run auth -- '<userToken>'
 npm start              # 前台跑；或用 npm run up 后台跑
-npm test               # 272 个用例（253 + 19 浏览器）；没有 Chromium 时浏览器用例会自动 skip
+npm test               # 286 个用例（267 + 19 浏览器）；没有 Chromium 时浏览器用例会自动 skip
 npm run exe            # 打包成 Windows 单 exe → dist/win-x64/（目标机器零安装）
 docker build -t cz-dsapi .   # 构建镜像（需要本地有 docker）
 ```
