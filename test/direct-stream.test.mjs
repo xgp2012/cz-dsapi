@@ -7,6 +7,8 @@ import {
   contentOf,
   createSseParser,
   createStreamState,
+  createTextTracker,
+  materializeFragment,
   reasoningOf,
 } from '../src/direct/stream.mjs';
 
@@ -101,4 +103,94 @@ test('未知路径不影响文本', () => {
   applyPatch(state, { p: 'response/fragments/-1/elapsed_secs', o: 'SET', v: 1.2 });
   applyPatch(state, { p: 'response/whatever', o: 'SET', v: 'x' });
   assert.equal(contentOf(state), 'a');
+});
+
+test('追加走增量缓冲：读取前 content 允许滞后，读时合并且幂等', () => {
+  const state = createStreamState();
+  applyPatch(state, { v: { response: { fragments: [{ type: 'RESPONSE', content: '起' }] } } });
+
+  // 连续追加很多帧，模拟长回答：content 本身不该被反复整段复制
+  let expected = '起';
+  for (let i = 0; i < 200; i += 1) {
+    applyPatch(state, { v: 'x' });
+    expected += 'x';
+  }
+
+  const fragment = state.fragments[0];
+  assert.ok(Array.isArray(fragment._parts), '追加应该先进增量缓冲，而不是直接拼字符串');
+
+  // 第一次读：合并
+  assert.equal(contentOf(state), expected);
+  assert.equal(fragment._parts, undefined, '合并后必须清掉增量缓冲');
+
+  // 第二次读：幂等，不能重复追加
+  assert.equal(contentOf(state), expected);
+  assert.equal(contentOf(state), expected);
+});
+
+test('materializeFragment：对来自快照的片段是空操作', () => {
+  const fragment = { type: 'RESPONSE', content: '快照内容' };
+  materializeFragment(fragment);
+  assert.equal(fragment.content, '快照内容');
+  assert.equal(fragment._parts, undefined);
+});
+
+test('增量缓冲 + 快照替换：追踪器不丢字也不重复', () => {
+  const state = createStreamState();
+  applyPatch(state, { v: { response: { fragments: [{ id: 1, type: 'RESPONSE', content: 'AB' }] } } });
+  const tracker = createTextTracker();
+  let sent = tracker(state.fragments, 'RESPONSE');
+  assert.equal(sent, 'AB');
+
+  // 常态追加：只返回新增量
+  applyPatch(state, { v: 'CD' });
+  const delta = tracker(state.fragments, 'RESPONSE');
+  assert.equal(delta, 'CD');
+  sent += delta;
+
+  // 快照整体替换成更长的同前缀内容：不能重复发出已有的部分
+  applyPatch(state, {
+    v: { response: { fragments: [{ id: 2, type: 'RESPONSE', content: 'ABCDE' }] } },
+  });
+  const more = tracker(state.fragments, 'RESPONSE');
+  assert.equal(more, 'E');
+  assert.equal(sent + more, 'ABCDE');
+});
+
+test('追踪器：片段被中间改写时返回 null，交给调用方回退全文', () => {
+  const state = createStreamState();
+  applyPatch(state, {
+    v: { response: { fragments: [{ id: 1, type: 'RESPONSE', content: 'ABC' }] } },
+  });
+  const tracker = createTextTracker();
+  assert.equal(tracker(state.fragments, 'RESPONSE'), 'ABC');
+
+  // 内容变短（改写而非追加）→ 无法增量
+  applyPatch(state, {
+    v: { response: { fragments: [{ id: 2, type: 'RESPONSE', content: 'XY' }] } },
+  });
+  assert.equal(tracker(state.fragments, 'RESPONSE'), null);
+});
+
+test('SSE 切帧：超长单帧分成很多块也能解析（不随长度二次退化）', () => {
+  const got = [];
+  const parser = createSseParser((data) => got.push(data));
+  const big = 'x'.repeat(20_000);
+  const raw = `data: {"v":"${big}"}\n\ndata: {"v":"尾"}\n\n`;
+
+  // 每次只喂 13 字节，强制跨块
+  for (let i = 0; i < raw.length; i += 13) parser.push(raw.slice(i, i + 13));
+
+  assert.equal(got.length, 2);
+  assert.equal(got[0].v, big);
+  assert.equal(got[1].v, '尾');
+});
+
+test('SSE flush：未以空行结尾的残帧也要处理', () => {
+  const got = [];
+  const parser = createSseParser((data) => got.push(data));
+  parser.push('data: {"v":"半"}');
+  assert.equal(got.length, 0, '没有帧结束符时不该提前回调');
+  parser.flush();
+  assert.deepEqual(got, [{ v: '半' }]);
 });

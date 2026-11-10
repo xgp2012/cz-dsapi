@@ -51,7 +51,8 @@ export function createChatRunner({ config, log, web }) {
         throw new ApiError(400, '当前引擎不支持图片输入', { code: 'image_not_supported' });
       }
       const loaded = await Promise.all(request.images.map((image) => loadImage(image.url, { logger: log })));
-      imageIds.push(...(await web.uploadImages(loaded)));
+      // signal 透传：客户端已断开时不该继续往上游传文件（白烧额度，且结果没人收）
+      imageIds.push(...(await web.uploadImages(loaded, { signal })));
       log?.info?.('已上传图片', { count: imageIds.length });
     }
 
@@ -60,7 +61,7 @@ export function createChatRunner({ config, log, web }) {
       if (typeof web.uploadAttachments !== 'function') {
         throw new PromptTooLongError('当前引擎不支持附件上传，无法承载超长上下文');
       }
-      const ids = await web.uploadAttachments([plan.attachment]);
+      const ids = await web.uploadAttachments([plan.attachment], { signal });
       log?.info?.('上下文超长，较早内容已转为附件', {
         name: plan.attachment.name,
         chars: plan.attachment.chars,

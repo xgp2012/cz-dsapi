@@ -22,11 +22,34 @@ function lastFragment(state) {
   return state.fragments[state.fragments.length - 1];
 }
 
+/**
+ * 给最后一段追加文本。
+ *
+ * 不能写 `fragment.content += text`：长回答里每帧都会把整段内容复制一遍，
+ * 是继「SSE buffer 拼接」和「全文 join」之后的第三处二次开销，而且它发生在
+ * 最热的路径上（每个 delta 一帧）。这里把增量记进 `_parts`，等到真正读取
+ * `content` 时才合并；合并是幂等的，读多少次都不会重复追加。
+ *
+ * `_parts` 是内部字段，但 `fragments` 会被快照整体替换（见 applyPatch 的
+ * 无路径分支），所以 `_parts` 只在「自己累加过」的片段上存在，缺省即「没有
+ * 待合并的增量」，对来自快照的片段天然安全。
+ */
 function appendToLast(state, text) {
   if (!text) return;
   const fragment = lastFragment(state);
   if (!fragment) return;
-  fragment.content = (fragment.content || '') + text;
+  if (Array.isArray(fragment._parts)) fragment._parts.push(text);
+  else fragment._parts = [text];
+}
+
+/** 把待合并的增量并进 content（幂等：合并后清掉 _parts） */
+export function materializeFragment(fragment) {
+  if (!fragment || !Array.isArray(fragment._parts)) return fragment;
+  const pending = fragment._parts;
+  fragment._parts = undefined;
+  if (!pending.length) return fragment;
+  fragment.content = (fragment.content || '') + pending.join('');
+  return fragment;
 }
 
 export function applyPatch(state, patch) {
@@ -87,10 +110,13 @@ export function applyPatch(state, patch) {
 
 /** 按片段类型汇总文本 */
 export function collectText(state, type) {
-  return state.fragments
-    .filter((f) => f && f.type === type)
-    .map((f) => f.content || '')
-    .join('');
+  let out = '';
+  for (const f of state.fragments) {
+    if (!f || f.type !== type) continue;
+    materializeFragment(f);
+    out += f.content || '';
+  }
+  return out;
 }
 
 export const contentOf = (state) => collectText(state, 'RESPONSE');
@@ -115,7 +141,7 @@ export const reasoningOf = (state) => collectText(state, 'THINK');
  */
 export function createTextTracker() {
   let parts = []; // 上次见到的该类型片段对象（按顺序）
-  let contents = []; // 与 parts 对应的内容字符串
+  let contents = []; // 与 parts 对应的内容字符串（已合并的权威内容）
 
   return (fragments, type) => {
     const next = [];
@@ -129,6 +155,18 @@ export function createTextTracker() {
     for (let i = 0; i < parts.length; i += 1) {
       const oldContent = contents[i];
       const frag = next[i];
+      // 片段自己累加过增量时，本批新增量就在 _parts 里：直接用 join 得到增量，
+      // 不必为了「看一眼变没变」把整段内容合并出来（合并是 O(旧内容长度)）。
+      const pending = frag === parts[i] && Array.isArray(frag._parts) ? frag._parts : null;
+      if (pending) {
+        if (!pending.length) continue;
+        materializeFragment(frag);
+        const newContent = frag.content || '';
+        if (newContent.length < oldContent.length) return null; // 回退：无法增量
+        delta += pending.join('');
+        changed = true;
+        continue;
+      }
       const newContent = frag.content || '';
       if (newContent === oldContent) continue;
       if (newContent.length < oldContent.length) return null; // 回退：无法增量
@@ -149,11 +187,13 @@ export function createTextTracker() {
       return null; // 中间改写：无法增量
     }
     for (let i = parts.length; i < next.length; i += 1) {
+      materializeFragment(next[i]);
       delta += next[i].content || '';
       changed = true;
     }
     // 即使 delta 为空也要更新快照，否则下次会误判
     parts = next.slice();
+    // 批量取内容：合并过增量的片段本次已是最新值，剩余部分只读 content。
     contents = next.map((f) => f.content || '');
     return changed ? delta : '';
   };
@@ -161,25 +201,23 @@ export function createTextTracker() {
 
 /** 把 SSE 文本流切成一个个 data JSON，逐帧回调 */
 export function createSseParser(onData, onEvent) {
-  let buffer = '';
-  let offset = 0;
+  // 待解析的剩余文本。原实现是 `buffer += chunk`，每次 push 都要复制整个剩余串；
+  // 现在只拼接「残留尾巴 + 新 chunk」，而残留尾巴在正常情况下是半帧（几十字节），
+  // 消费完立刻被 slice 掉，所以单次 push 的成本与帧数线性、与历史长度无关。
+  let pending = '';
 
   return {
     push(chunk) {
-      buffer += chunk;
+      if (!chunk) return;
+      pending = pending ? pending + chunk : chunk;
+      let offset = 0;
       let index;
-      // 原实现每解析一帧就 buffer.slice() 一次，把剩余部分整体复制：
-      // 一个 chunk 里有 N 帧时是 O(N * 剩余长度) 的二次开销。
-      // 改成只移动 offset，每次 push 结束时才压缩一次。
-      while ((index = buffer.indexOf('\n\n', offset)) >= 0) {
-        const raw = buffer.slice(offset, index);
+      while ((index = pending.indexOf('\n\n', offset)) >= 0) {
+        const raw = pending.slice(offset, index);
         offset = index + 2;
         this.handleFrame(raw);
       }
-      if (offset > 0) {
-        buffer = buffer.slice(offset);
-        offset = 0;
-      }
+      if (offset > 0) pending = pending.slice(offset);
     },
     handleFrame(raw) {
       if (!raw.trim()) return;
@@ -201,12 +239,11 @@ export function createSseParser(onData, onEvent) {
       }
     },
     flush() {
-      const rest = buffer.slice(offset);
+      const rest = pending;
       if (rest.trim()) {
         this.handleFrame(rest);
       }
-      buffer = '';
-      offset = 0;
+      pending = '';
     },
   };
 }

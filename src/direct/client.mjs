@@ -11,7 +11,7 @@ import {
   typingDelay,
 } from './fingerprint.mjs';
 import { PowSolver } from './pow.mjs';
-import { applyPatch, createSseParser, createStreamState, createTextTracker } from './stream.mjs';
+import { applyPatch, collectText, createSseParser, createStreamState, createTextTracker } from './stream.mjs';
 
 const COMPLETION_PATH = '/api/v0/chat/completion';
 const UPLOAD_PATH = '/api/v0/file/upload_file';
@@ -388,10 +388,9 @@ export class DirectEngine {
             return emitted + delta;
           }
           if (delta === null) {
-            const full = state.fragments
-              .filter((f) => f?.type === type)
-              .map((f) => f.content || '')
-              .join('');
+            // 回退分支必须走 collectText：它会在读取前把 _parts 里的增量合并进
+            // content。直接读 f.content 会漏掉尚未合并的部分，导致回退时反而丢字。
+            const full = collectText(state, type);
             if (full.length > emitted.length && full.startsWith(emitted)) {
               if (!firstTokenAt) firstTokenAt = Date.now();
               onEmit?.(full.slice(emitted.length));
@@ -485,7 +484,7 @@ export class DirectEngine {
    * 把图片传成 DeepSeek 的附件，返回 file id 列表（塞进 ref_file_ids）。
    * 按内容 hash 缓存 30 分钟，同一张图重复问不会重复上传。
    */
-  async uploadImages(images = []) {
+  async uploadImages(images = [], { signal } = {}) {
     if (!images.length) return [];
     await this.ensureStarted();
     const account = this.#uploadAccount();
@@ -502,11 +501,15 @@ export class DirectEngine {
         });
       }
       ids.push(
-        await this.#uploadFile(account, {
-          buffer,
-          mime: image.mime || 'image/png',
-          name: image.name || `image-${Date.now()}.png`,
-        }),
+        await this.#uploadFile(
+          account,
+          {
+            buffer,
+            mime: image.mime || 'image/png',
+            name: image.name || `image-${Date.now()}.png`,
+          },
+          signal,
+        ),
       );
     }
     return ids;
@@ -516,7 +519,7 @@ export class DirectEngine {
    * 通用附件上传：超长上下文拆出来的 .txt 走这里。
    * 和图片共用一套 hash 缓存，同样内容 30 分钟内不重复上传。
    */
-  async uploadAttachments(files = []) {
+  async uploadAttachments(files = [], { signal } = {}) {
     if (!files.length) return [];
     await this.ensureStarted();
     const account = this.#uploadAccount();
@@ -533,11 +536,15 @@ export class DirectEngine {
         });
       }
       ids.push(
-        await this.#uploadFile(account, {
-          buffer,
-          mime: file.mime || 'text/plain',
-          name: file.name || `context-${Date.now()}.txt`,
-        }),
+        await this.#uploadFile(
+          account,
+          {
+            buffer,
+            mime: file.mime || 'text/plain',
+            name: file.name || `context-${Date.now()}.txt`,
+          },
+          signal,
+        ),
       );
     }
     return ids;
@@ -560,7 +567,7 @@ export class DirectEngine {
     return this.pool.accounts[0];
   }
 
-  async #uploadFile(account, file) {
+  async #uploadFile(account, file, signal) {
     const { buffer, mime, name } = file;
     const hash = crypto.createHash('sha256').update(buffer).digest('hex');
     const cached = this.fileCache.get(hash);
@@ -576,7 +583,7 @@ export class DirectEngine {
       if (this.fileCache.size >= 512) this.fileCache.delete(this.fileCache.keys().next().value);
     }
 
-    const powHeader = await this.#powHeaderFor(account, UPLOAD_PATH);
+    const powHeader = await this.#powHeaderFor(account, UPLOAD_PATH, signal);
     const form = new FormData();
     form.append('file', new Blob([buffer], { type: mime }), name);
 
@@ -593,6 +600,7 @@ export class DirectEngine {
       method: 'POST',
       headers: { ...uploadHeaders, 'x-ds-pow-response': powHeader },
       body: form,
+      signal,
     });
     const body = await readJsonSafely(res);
     const id = body?.data?.biz_data?.id;
@@ -659,11 +667,12 @@ export class DirectEngine {
     return session.id;
   }
 
-  async #fetchChallenge(account, targetPath = COMPLETION_PATH) {
+  async #fetchChallenge(account, targetPath = COMPLETION_PATH, signal) {
     const res = await fetch(`${this.baseUrl}/api/v0/chat/create_pow_challenge`, {
       method: 'POST',
       headers: this.#headers(account),
       body: JSON.stringify({ target_path: targetPath }),
+      signal,
     });
     const body = await readJsonSafely(res);
     const challenge = body?.data?.biz_data?.challenge;
@@ -684,33 +693,34 @@ export class DirectEngine {
    * 说明 challenge 已过期/即将过期，服务端会拒收，直接丢弃并重新 fetch+solve。
    */
   async #powHeader(account) {
-    const solved = await this.#takePow(account);
-    if (powNotExpired(solved.expireAt)) return solved.header;
-    this.log.debug(
-      `账号 #${account.index + 1} 预解的 PoW 已过期（expire_at=${solved.expireAt}），重新获取`,
-    );
-    return (await this.#solveNew(account)).header;
-  }
-
-  /** 取走一个预解的 PoW；没有预解就共享进行中的求解，实在没有再现场解一个。 */
-  async #takePow(account) {
-    const pooled = account.powPool.shift();
-    if (pooled) {
-      // 取走的同时补上下一发，避免并发请求到达时池子被抢空、退化成现场求解
-      this.#prefetchPow(account);
-      return pooled;
+    // 池里的预解件可能全部过期（空闲很久后突然来请求）：挑第一份没过期的，
+    // 过期件直接丢掉。原来只看 shift 出来的那一个 —— 若它过期就现场重解，
+    // 但池子里剩下那发同样过期，下次请求要再重解一次，等于白解两发。
+    let solved = null;
+    while (account.powPool.length) {
+      const candidate = account.powPool.shift();
+      if (powNotExpired(candidate.expireAt)) {
+        solved = candidate;
+        break;
+      }
+      this.log.debug(
+        `账号 #${account.index + 1} 丢弃已过期的预解 PoW（expire_at=${candidate.expireAt}）`,
+      );
     }
-    // 有共享的进行中求解就等它（并发请求不该各自重解一次）
-    if (account.powPending) {
+    // 池子空了但后台仍在解：那是并发请求共享的结果，直接等它，别再起一发
+    if (!solved && account.powPending) {
       try {
-        const solved = await account.powPending;
-        this.#prefetchPow(account);
-        return solved;
+        solved = await account.powPending;
       } catch {
-        // 共享求解失败，落到下面自己解
+        // 共享求解失败，落到下面现场解
       }
     }
-    return this.#solveNew(account);
+    // 取走（或丢弃）后立刻补池：过期场景下这里的补池尤其重要，
+    // 否则一次空闲就可能让后续每个请求都退化成现场 fetch+solve。
+    this.#prefetchPow(account);
+    if (solved && powNotExpired(solved.expireAt)) return solved.header;
+    this.log.debug(`账号 #${account.index + 1} 没有可用的预解 PoW，现场获取`);
+    return (await this.#solveNew(account)).header;
   }
 
   #prefetchPow(account) {
@@ -730,8 +740,8 @@ export class DirectEngine {
       });
   }
 
-  async #powHeaderFor(account, targetPath) {
-    const challenge = await this.#fetchChallenge(account, targetPath);
+  async #powHeaderFor(account, targetPath, signal) {
+    const challenge = await this.#fetchChallenge(account, targetPath, signal);
     const solved = await this.pow.solve({
       challenge: challenge.challenge,
       salt: challenge.salt,
