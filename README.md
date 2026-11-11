@@ -100,16 +100,50 @@ npm run down      # 停止
 
 不需要装 Node、Go 或 Chromium —— 镜像里都带好了（含编译好的 Go PoW 求解器）。
 
+#### 方式 A：docker compose（推荐）
+
+仓库里的 [`docker-compose.yml`](./docker-compose.yml) 已经把容器该注意的都配好了：
+
+```bash
+cp .env.compose.example .env   # 填 CZ_API_KEY（必填）和 token
+docker compose up -d
+# 打开 http://<服务器IP>:8787/admin/
+```
+
+它替你处理了四件事：
+
+| 配置 | 为什么必须 |
+|---|---|
+| `stop_grace_period: 15s` | 必须大于 `SHUTDOWN_TIMEOUT_MS`(8s)，否则关闭时被 SIGKILL、Chromium 变孤儿 |
+| `API_KEY=${CZ_API_KEY:?}` | 容器监听 `0.0.0.0`，漏设 = 号池额度白送。**没填时 compose 直接拒绝启动** |
+| `logging: max-size 20m` | 不限制的话 `docker logs` 能涨到几个 G 吃满磁盘 |
+| `healthcheck` | 配合 `restart: unless-stopped` 自动拉起 |
+
+常用命令：
+
+```bash
+docker compose logs -f          # 看日志
+docker compose up -d            # 改完配置后重建（环境变量变更需要重建容器）
+docker compose down             # 停止（数据卷保留）
+docker compose pull && docker compose up -d   # 升级镜像
+```
+
+#### 方式 B：docker run
+
 ```bash
 docker run -d --name cz-dsapi \
   -p 8787:8787 \
+  -e API_KEY=<强随机串> \
   -e DEEPSEEK_USER_TOKEN=<你的 userToken> \
   -v cz-dsapi-data:/app/data \
+  -v /etc/localtime:/etc/localtime:ro \
+  --stop-timeout 15 \
   --restart unless-stopped \
   ghcr.io/xgp2012/cz-dsapi:latest
 ```
 
 `-v cz-dsapi-data:/app/data` 别省：号池和日志都在里面，不挂卷重建容器就丢了。
+`--stop-timeout 15` 对应 compose 的 `stop_grace_period`，默认 10s 也够用但对齐一下更稳。
 
 也可以第一次**不传 token**，启动后打开 <http://localhost:8787/admin/>，
 控制台会自动跳到「账号」页引导你粘贴 —— 和本地跑完全一样的流程。

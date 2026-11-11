@@ -1,0 +1,135 @@
+# ---------------------------------------------------------------------------
+# cz-dsapi —— Docker Compose 部署
+#
+# 快速开始：
+#   1. cp .env.compose.example .env   然后填 CZ_API_KEY（必填）和 token
+#   2. docker compose up -d
+#   3. 打开 http://<宿主机IP>:8787/admin/
+#
+# 也可以跳过第 1 步直接 up：此时 compose 会因为缺 CZ_API_KEY 而拒绝启动，
+# 并提示你去设置 —— 这是有意的，容器默认监听 0.0.0.0，不能让没 key 的实例跑起来。
+# 想先不设 key 试跑，就临时用：CZ_API_KEY=dev docker compose up -d
+#
+# 注意：容器内 /app 是只读的，控制台「设置」页无法写回 .env。
+#       所有配置都必须通过下面的 environment 传入 —— 改完 docker compose up -d 生效。
+# ---------------------------------------------------------------------------
+
+services:
+  cz-dsapi:
+    image: ghcr.io/xgp2012/cz-dsapi:latest
+    # 想用本地源码构建就把上面换成本段（需要本机有 docker）：
+    # build: .
+    container_name: cz-dsapi
+    restart: unless-stopped
+
+    ports:
+      # 左边是宿主机端口，改了之后控制台地址也要跟着改
+      # 只想本机访问就写 "127.0.0.1:8787:8787"（配合下面 API_KEY 留空也相对安全）
+      - "8787:8787"
+
+    environment:
+      # ------------------------------ 必填 ------------------------------
+      # ⚠️ API_KEY：容器默认监听 0.0.0.0，等于对所有能访问该端口的人开放。
+      #    留空 = 任何人拿到地址就能白嫖你的号池额度。请务必改成强随机串。
+      #    生成：openssl rand -hex 24
+      API_KEY=${CZ_API_KEY:?请设置 CZ_API_KEY，例如在 .env 里写 CZ_API_KEY=xxx}
+
+      # 登录态（二选一，或都留空走控制台粘贴）：
+      #   单个 token
+      DEEPSEEK_USER_TOKEN=${CZ_USER_TOKEN:-}
+      #   号池：多个 token 用空格或逗号分隔
+      DEEPSEEK_USER_TOKENS=${CZ_USER_TOKENS:-}
+
+      # ---------------------------- 引擎与模型 ----------------------------
+      # direct：直连网页接口 + Go 解 PoW，最快、不吃内存（推荐）
+      # browser：Playwright 驱动真实网页，慢但更贴近真人行为
+      ENGINE=direct
+      DEEPSEEK_THINKING=always
+      DEEPSEEK_SEARCH=false
+      DEFAULT_MODEL=deepseek-flash
+
+      # ---------------------------- 运行与并发 ----------------------------
+      # 直连引擎靠号池扛限流，不是靠放慢。多号时可以适当提高。
+      CONCURRENCY=4
+      QUEUE_LIMIT=64
+      REQUEST_TIMEOUT_MS=240000
+      ACCOUNT_COOLDOWN_MS=60000
+      # 多号时把并发摊开，避免全压在一个号上撞风控；0 = 不限
+      MAX_INFLIGHT_PER_ACCOUNT=2
+
+      # 账号后台探活：每 10 分钟复检一个停用/冷却中的号，通过就自动恢复。
+      # token 失效后不需要人工重启进程 —— 这是容器里最省心的一项。
+      ACCOUNT_PROBE_INTERVAL_MS=600000
+
+      # 优雅关闭：必须小于 docker stop 的宽限（下面 stop_grace_period）。
+      # 留 2s 余量，否则会被 SIGKILL，Chromium 子进程变孤儿。
+      SHUTDOWN_TIMEOUT_MS=8000
+
+      # ------------------------------ 安全 ------------------------------
+      RATE_LIMIT_ENABLED=true
+      RATE_LIMIT_PER_MINUTE=60
+      # 前面挂了 Nginx/Traefik 等反代才需要打开，直连时保持注释（否则可被伪造 XFF 绕过限流）
+      # TRUST_PROXY=loopback
+      # 允许跨域的前端来源，默认 * 适合大多数 OpenAI SDK；收紧成具体域名更安全
+      # CORS_ORIGIN=*
+
+      # ------------------------------ 其它 ------------------------------
+      LOG_LEVEL=info
+      TZ=Asia/Shanghai
+
+    volumes:
+      # 号池（auth.json）、日志、截图产物都在这里。
+      # ⚠️ 别省：不挂卷重建容器，号池就丢了，得重新粘一遍 token。
+      - cz-data:/app/data
+      # 如果你希望「设置」页能保存配置，可以挂一个可写的 .env（默认不挂）：
+      # - ./.env.container:/app/.env
+
+    # ✅ 关键：必须 >= SHUTDOWN_TIMEOUT_MS，给优雅关闭留出时间。
+    #    默认 10s 也能工作，这里显式写出来是为了让两者关系一目了然。
+    stop_grace_period: 15s
+
+    healthcheck:
+      # 镜像自带 HEALTHCHECK，这里再写一遍只是为了让 compose 的 depends_on 能引用
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+    # 日志轮转：不限制的话 docker logs 能涨到几个 G，把宿主机磁盘吃满
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+    # ---------------------------- 资源限制（可选） ----------------------------
+    # 直连引擎不吃内存；browser 引擎每个 Chromium 约 200-400MB，
+    # 用 ENGINE=browser 时把 mem_limit 提到 2g 以上，并把 CONCURRENCY 降到 1-2。
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 1g
+
+    # ---------------------------- 时区与字体（可选） ----------------------------
+    # 保持默认即可：镜像里已装 tzdata 并设 TZ=Asia/Shanghai。
+    # 需要额外字体（比如中文渲染/截图）时挂载：
+    # - /usr/share/fonts:/usr/share/fonts:ro
+
+    # ---------------------------- 网络模式（可选） ----------------------------
+    # 如果你要让容器访问宿主机上的代理（BROWSER_ARGS=--proxy-server=...）：
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+volumes:
+  cz-data:
+    # 想指定落盘位置（比如放到大盘上）就改成：
+    # driver: local
+    # driver_opts:
+    #   type: none
+    #   o: bind
+    #   device: /srv/cz-dsapi/data

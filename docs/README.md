@@ -54,6 +54,16 @@ docker build -t cz-dsapi .   # 构建镜像（需要本地有 docker）
 | 源码包 | `npm run package` | Node 20+ / Go / Chromium | 开发、调试 |
 | Windows exe | `npm run exe` | **什么都不用装**（解压即用） | 不懂技术的 Windows 用户 |
 | Docker 镜像 | CI 自动推 `ghcr.io/xgp2012/cz-dsapi` | 只要 Docker | 服务器 / NAS |
+| Docker Compose | [docker-compose.yml](../docker-compose.yml) + [.env.compose.example](../.env.compose.example) | 只要 Docker Compose | **推荐给服务器**：带日志轮转、优雅关闭、健康检查 |
+
+Compose 版已经把容器专属的注意事项预置好了，其中两个是「不设就会出问题」的：
+
+- `stop_grace_period: 15s` 必须**大于** `SHUTDOWN_TIMEOUT_MS`（8s），
+  否则 `docker compose down` 会在优雅关闭完成前 SIGKILL，Chromium 子进程变孤儿；
+- `API_KEY` 用 `${CZ_API_KEY:?}` 写成**必填**：容器默认监听 `0.0.0.0`，
+  漏设就等于把号池额度白送出去。没填时 compose 会直接报错拒绝启动，而不是静默跑起来。
+
+配置全部走 `environment:`，因为镜像里 `/app` 只读、`.env` 写不进去（见 [§14.8](./DEVELOPMENT.md#148-docker-镜像dockerfile)）。
 
 exe 产物里 `src/`、`node_modules/`、`ms-playwright/` 必须和 `cz-dsapi.exe` 同目录 ——
 SEA 内嵌代码只能按 CommonJS 执行，装不下 ESM 源码。原因与两个 playwright 坑见
