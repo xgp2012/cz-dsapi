@@ -1537,12 +1537,52 @@ runtime  node:22-bookworm-slim   apt 运行时库 + 生产依赖 + chromium-head
 
 | 路径 | 内容 | 是否需挂卷 |
 |---|---|---|
-| `/app/data/` | `auth.json`（号池）、`server.log` | **是**，否则重建容器号池就丢 |
-| `/app/.env` | 「设置」页写回的配置 | 可选；容器里更推荐用 `-e` 环境变量 |
+| `/app/data/` | `auth.json`（号池）、`server.log`、`artifacts/`（截图）、`font-cache/` | **是**，否则重建容器号池就丢 |
+| `/app/.env` | 「设置」页写回的配置 | **容器里写不了**，见下 |
 
 除这两处外 `/app` 全是 root 只读，进程以 `node`（uid 1000）运行。
 `config.mjs#loadConfig` 里的 `fs.mkdirSync(dataDir)` 在目录已存在时不报错，
 所以 `DATA_DIR` 指向一个已 `chown` 好且挂载了卷的目录即可。
+
+`data/artifacts` 与 `data/font-cache` 在镜像里**预先建好并 chown**：
+它们平时由进程运行期 `mkdir`，但挂载卷之后卷根的属主来自宿主机，
+不预先建好就会出现「第一次出错要截图 → EACCES」这种最难排查的组合。
+
+#### 容器里 `.env` 写不进去是设计，不是 bug
+
+「设置」页会把配置写回 `/app/.env`，而容器里 `/app` 是 root 只读、进程以 `node` 跑。
+直接写的结果是 `EACCES` → 500 + 堆栈，用户完全不知道该怎么办。
+
+现在 `envWritable()` 在写入前先探（先探文件、再探目录，两步都失败才判定只读），
+探不到就返回 **409 + `env_not_writable`**，并在消息里直接给出三条可照做的替代方案：
+
+```
+容器里的 .env 不可写（/app/.env）。这是预期行为：镜像中 /app 是只读的，配置应当通过环境变量传入。
+请改用以下任一方式，然后 docker restart 容器：
+  docker run 时加  -e KEY=VALUE
+  或在 docker-compose.yml 的 environment: 段里声明
+  或挂载一个可写目录：-v cz-dsapi-data:/app/data 后把配置写进 .env 再挂进来
+```
+
+`GET /admin/api/config` 同时返回 `writable` / `writableHint` / `runtimeMode`，
+前端据此把表单置灰并显示原因，而不是等用户点「保存」才吃到错误。
+
+> 为什么用 409 而不是 500：这是**环境限制**，不是服务端故障。
+> 调用方按 409 处理才对（500 会被当成 bug 报上来）。
+
+#### 容器的其他特异性问题
+
+这些问题在本机开发时**全部不复现**，只有真正跑进镜像才暴露：
+
+| 问题 | 现象 | 处理 |
+|---|---|---|
+| **日志时间是 UTC** | 日志时间与本地时间差 8 小时，排查冷却/限流窗口时判断全错 | `logger.mjs` 原来用 `toISOString().slice(11,23)`（永远 UTC），改用按进程时区取时；`Dockerfile` 装 `tzdata` 并设 `TZ=Asia/Shanghai` |
+| **优雅关闭被 SIGKILL** | `docker stop` 先发 SIGTERM，10s 后直接 SIGKILL。`web.close()` 关 Chromium 超时就被强杀，子进程变孤儿 | 加 `SHUTDOWN_TIMEOUT_MS`（默认 8s，**小于** 10s 宽限）+ `shuttingDown` 重入保护 + 超时强制退出 |
+| **启动横幅地址打不开** | 容器里 `HOST=0.0.0.0` 时横幅打印 `127.0.0.1`，在宿主机浏览器里点不开，被误判成「服务没起来」 | 检测到容器时额外打印一段说明，给出 `<宿主机IP>:PORT` |
+| **空 API_KEY + 0.0.0.0 被白嫖** | 容器默认监听 0.0.0.0，忘了设 `API_KEY` 就等于对外裸奔 | 容器模式下若 `API_KEY` 为空，启动时打 warn 明确警告 |
+| **截图目录 EACCES** | 挂卷后 `data/` 属主是宿主机用户，`mkdir artifacts` 失败 | 镜像里预先建好并 chown（见上） |
+
+容器判定沿用 `detectRuntimeMode()`（见 §14.7），同时认 `CZDSAPI_DOCKER=1` 与 `/.dockerenv`。
 
 #### 镜像瘦身：两个坑（420MB → 205MB）
 

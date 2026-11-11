@@ -63,7 +63,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libxkbcommon0 \
       libxrandr2 \
       tini \
+      tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+# 时区：容器默认 UTC，日志时间是 UTC 会让「对账上游限流窗口」产生 8 小时错觉。
+# tzdata 必须装上，否则 TZ 只是个没人认的字符串。
+# 运行时可用 -e TZ=UTC 覆盖。
+ENV TZ=Asia/Shanghai
 
 WORKDIR /app
 
@@ -97,12 +103,24 @@ RUN chmod +x ./bin/ds-pow
 # 只 chown 数据目录，**不要** chown -R /app：
 # 那会把刚装好的 Chromium（约 210MB）整份复制到新的一层，镜像白胖 109MB（实测）。
 # /app 下其余文件都是 root 拥有但只读，进程以 node 身份运行时不需要写权限。
-RUN mkdir -p /app/data && chown -R node:node /app/data
+#
+# 顺便建好 browser 引擎要用的子目录（artifacts 截图、font-cache）：
+# 它们由进程运行期 mkdir，但挂载卷之后卷根上的权限来自宿主机，
+# 事先建好并 chown 能避免第一次截图就 EACCES。
+RUN mkdir -p /app/data/artifacts /app/data/font-cache \
+    && chown -R node:node /app/data
 
 # 用非 root 跑：容器里跑浏览器 + 处理外部输入，没必要给 root
 USER node
 
 # 容器里必须监听 0.0.0.0，否则端口映射不出去
+#
+# 几个容器专属的说明：
+#   - NODE_ENV=production：关掉开发期行为
+#   - 不设 NO_COLOR：日志已按 process.stdout.isTTY 自动关色，
+#     docker logs 本来就不带 TTY，不需要额外干预
+#   - 不设 NODE_OPTIONS=--enable-source-maps：本项目是纯 ESM 源码直跑，
+#     没有构建产物，栈本来就指回源码行号，设了是多余的
 ENV HOST=0.0.0.0 \
     PORT=8787 \
     DATA_DIR=/app/data \

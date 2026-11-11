@@ -208,6 +208,10 @@ export function loadConfig(env = process.env) {
       // 成功就自动恢复（token 失效不再需要人工重启），0 = 关闭。
       // 下限 60s：探活本身不能成为风控来源。
       accountProbeIntervalMs: int(env.ACCOUNT_PROBE_INTERVAL_MS, 10 * 60_000),
+      // 优雅关闭最多等多久（毫秒），超时强制退出。
+      // 容器默认 `--stop-timeout` 是 10s，所以默认 8s 留出余量：
+      // 自己不退就会被 SIGKILL，那样子进程变孤儿、日志来不及落盘。
+      shutdownTimeoutMs: int(env.SHUTDOWN_TIMEOUT_MS, 8000),
     },
   };
 }

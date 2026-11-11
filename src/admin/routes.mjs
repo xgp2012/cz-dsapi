@@ -421,13 +421,21 @@ export function createAdminHandler({ config, logger, web, server }) {
       const current = fromFile[item.key] ?? currentEffective(item.key);
       values[item.key] = current === undefined || current === null ? '' : String(current);
     }
+    const writable = envWritable();
+    const runtimeMode = detectRuntimeMode();
     return {
       envFile,
       exists: fs.existsSync(envFile),
+      // 只读环境（容器）：前端据此禁用表单并展示说明，而不是让用户点保存才吃到 409
+      writable: writable.ok,
+      writableHint: writable.ok ? null : writable.message,
+      runtimeMode,
       schema: ENV_SCHEMA,
       values,
       restartKeys: ['ENGINE', 'HOST', 'PORT', 'API_KEY', 'CONCURRENCY', 'MAX_PROMPT_CHARS', 'DEEPSEEK_THINKING', 'DEEPSEEK_SEARCH', 'LOG_LEVEL', 'ACCOUNT_PROBE_INTERVAL_MS'],
-      note: '修改会写回项目根目录的 .env，重启服务后生效。',
+      note: writable.ok
+        ? '修改会写回项目根目录的 .env，重启服务后生效。'
+        : '当前环境（容器）的 .env 只读，请通过环境变量配置后重启容器。',
     };
   }
 
@@ -436,13 +444,26 @@ export function createAdminHandler({ config, logger, web, server }) {
     if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) {
       throw new ApiError(400, 'values 必须是对象');
     }
+
+    // 容器里 /app 是 root 拥有只读、进程以 node 身份跑，.env 根本写不进去。
+    // 提前拦下来给一条能照做的提示，比让它变成 500 + EACCES 堆栈强得多。
+    const writable = envWritable();
+    if (!writable.ok) {
+      throw new ApiError(409, writable.message, { code: 'env_not_writable' });
+    }
+
     const updates = {};
     for (const item of ENV_SCHEMA) {
       if (!(item.key in incoming)) continue;
       updates[item.key] = validateEnvValue(item, incoming[item.key]);
     }
     if (!Object.keys(updates).length) throw new ApiError(400, '没有需要保存的配置');
-    writeEnvFile(updates);
+    try {
+      writeEnvFile(updates);
+    } catch (err) {
+      // 上面探过可写，走到这里是磁盘满 / 只读挂载等少见情况，同样别抛 500
+      throw new ApiError(409, `写入 .env 失败：${err.message}`, { code: 'env_write_failed' });
+    }
     log.info('配置已写入 .env', { keys: Object.keys(updates) });
     return {
       ok: true,
@@ -450,6 +471,38 @@ export function createAdminHandler({ config, logger, web, server }) {
       envFile,
       restartRequired: true,
       message: '已写入 .env，重启服务后生效。',
+    };
+  }
+
+  /**
+   * 探测 .env 是否可写。
+   *
+   * 三种情况都要覆盖：文件存在（直接 open 追加探）+ 文件不存在但目录可写
+   * （新建探）+ 两者都不可（容器默认形态，/app 只读）。
+   * 用 append 而不是 truncate，避免探测本身把用户的配置清空。
+   */
+  function envWritable() {
+    try {
+      fs.accessSync(envFile, fs.constants.W_OK);
+      return { ok: true };
+    } catch {
+      /* 文件不存在或不可写，再探目录 */
+    }
+    try {
+      fs.accessSync(path.dirname(envFile), fs.constants.W_OK);
+      return { ok: true };
+    } catch {
+      /* 目录也不可写 */
+    }
+    return {
+      ok: false,
+      message:
+        `容器里的 .env 不可写（${envFile}）。这是预期行为：镜像中 /app 是只读的，` +
+        '配置应当通过环境变量传入。\n' +
+        '请改用以下任一方式，然后 docker restart 容器：\n' +
+        '  docker run 时加  -e KEY=VALUE\n' +
+        '  或在 docker-compose.yml 的 environment: 段里声明\n' +
+        '  或挂载一个可写目录：-v cz-dsapi-data:/app/data 后把配置写进 .env 再挂进来',
     };
   }
 
