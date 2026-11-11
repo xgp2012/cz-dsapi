@@ -113,6 +113,16 @@ ENV HOST=0.0.0.0 \
 # 也不吃内存（不需要常驻 Chromium）。想用浏览器引擎就设 ENGINE=browser。
 ENV ENGINE=direct
 
+# 告诉程序"我在容器里"。
+#
+# 控制台的「重启」按钮靠这个走对路径：容器里绝不能交给 scripts/server-ctl.mjs
+# （它 down 掉的是 1 号进程，容器当场退出；而且 slim 镜像没有 pgrep/ps）。
+# 设了它就是自重启：spawn 一个新的 node src/index.mjs，再优雅退出旧进程。
+#
+# 程序本身也会检查 /.dockerenv，这里显式设置是为了兜住非标准运行时
+# （podman / k8s 某些配置 / rootless 容器不一定有这个文件）。
+ENV CZDSAPI_DOCKER=1
+
 EXPOSE 8787
 
 # tini 负责回收僵尸进程：Playwright 会拉起一堆 Chromium 子进程，

@@ -134,6 +134,12 @@ docker run -d -p 8787:8787 -e ENGINE=browser \
 默认引擎是 `direct`（用镜像内置的 Go 求解器，更快、不吃内存）。
 镜像默认 `HOST=0.0.0.0`，容器里必须这样端口才映射得出去。
 
+> **容器里的「重启」是自重启，不是重启容器。**
+> 控制台的「重启」按钮会拉起一个新的 `node src/index.mjs` 并优雅退出旧进程
+> （镜像里设了 `CZDSAPI_DOCKER=1` 来识别形态）。
+> 它**不会**执行 `docker restart` —— 想重启整个容器请用 `docker restart <容器名>`。
+> 因为容器没有外部守护进程，杀 PID 1 就是容器退出，所以这条路径和 Windows exe 是同一套。
+
 <details>
 <summary>自己构建镜像</summary>
 

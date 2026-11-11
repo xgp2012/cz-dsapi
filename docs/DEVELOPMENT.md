@@ -1442,27 +1442,50 @@ SEA 内嵌的代码**一律按 CommonJS 执行**。实测 Node 24，内嵌一个
 
 所以第一次使用的完整路径是：**双击 `启动.bat` → 浏览器自动打开控制台 → 粘贴 token → 点重启 → 完成**。
 
-#### 打包版的「重启」为什么不能用 server-ctl.mjs
+#### 打包版 / 容器的「重启」为什么不能用 server-ctl.mjs
 
-`scripts/server-ctl.mjs` 是为**源码运行**写的，在 exe 里每一环都不成立：
+`scripts/server-ctl.mjs` 是为**源码运行**写的，在 exe 和容器里每一环都不成立：
 
-| server-ctl 依赖 | 在打包版里的实际情况 |
-|---|---|
-| `spawn(process.execPath, [脚本])` | `process.execPath` 是 `cz-dsapi.exe`，SEA 不接受脚本参数 |
-| `pgrep` / `ps` | Windows 上不存在 |
-| `process.kill(pid, 'SIGTERM')` | Windows 上不可靠（无真正的信号语义） |
-| `scripts/` 目录 | 根本没有被打进发行包 |
+| server-ctl 依赖 | 打包 exe | Docker 容器 |
+|---|---|---|
+| `spawn(process.execPath, [脚本])` | `process.execPath` 是 `cz-dsapi.exe`，SEA 不接受脚本参数 | execPath 是 `node`，**但 `scripts/` 不在镜像里**（Dockerfile 只 `COPY src/`） |
+| `pgrep` / `ps` | Windows 上不存在 | slim 镜像里没装 |
+| `process.kill(pid, 'SIGTERM')` | Windows 上不可靠（无真正的信号语义） | 可用，但**杀掉的是 1 号进程** |
+| `scripts/` 目录 | 没被打进发行包 | 没被拷进镜像 |
+| 杀了之后谁来拉起 | — | **没有外部守护**：PID 1 退出 = 容器退出 |
 
 早期版本直接把这个脚本路径写死，于是打包版点「重启」只会报
 `找不到重启脚本：...\scripts\server-ctl.mjs`。
+容器里更糟：它的 `restart` 是先 `down` 再 `up`，而 `down` 杀掉的是容器的 1 号进程 ——
+容器当场退出，`up` 那段**没有机会执行**，用户只会看到容器"无故死掉"。
 
-现在 `restartServer()` 按 `Boolean(process.env.CZDSAPI_ROOT)` 分派：
+现在由 `detectRuntimeMode()` 判定三种形态（**纯函数，可单测**，见 `test/restart.test.mjs`）：
 
-- **源码模式**：保持原样交给 `server-ctl restart`（pid 文件、pm2/systemd 检测都还在用）。
-- **打包模式**：`restartPackaged()` 自己动手 ——
-  1. `spawn(exe, [], { detached: true, stdio: 'ignore', cwd: rootDir })` 拉起新进程；
-  2. 稍后 `server.close()` 释放端口；
-  3. `process.kill(process.pid, 'SIGTERM')` 走 `index.mjs` 的优雅关闭。
+| 返回值 | 判据 | 重启走法 |
+|---|---|---|
+| `packaged` | `CZDSAPI_ROOT` 存在，或 execPath 不叫 `node` | `restartSelf()` |
+| `docker` | `CZDSAPI_DOCKER=1` 或 `/.dockerenv` 存在 | `restartSelf()` |
+| `source` | 其余（execPath 是 node 且非容器） | 交给 `server-ctl restart` |
+
+> **顺序很重要**：容器判定必须排在 `source` 之前。容器里 execPath 也叫 `node`，
+> 稍不注意就会落进源码分支去调一个根本不存在的脚本 —— 这正是本 bug 的成因。
+
+`restartSelf()` 的步骤（两种形态共用）：
+
+1. `spawn(exe, args, { detached: true, stdio: 'ignore', cwd: rootDir })` 拉起新进程；
+2. 稍后 `server.close()` 释放端口；
+3. `process.kill(process.pid, 'SIGTERM')` 走 `index.mjs` 的优雅关闭。
+
+两者的 `args` 不同，这点不能统一：
+
+| 形态 | args | 原因 |
+|---|---|---|
+| `packaged` | `[]` | SEA 里"exe + 无参数"就是完整命令，传 `src/index.mjs` 会被当成**用户参数** |
+| `docker` | `[<rootDir>/src/index.mjs]` | execPath 是 `node`，不传入口会打开 REPL 并立刻退出 |
+
+容器里的一个额外前提：新进程是**子进程**，旧进程退出后要被收养。镜像的
+`ENTRYPOINT` 是 `tini --`，它负责转发信号与回收子进程 —— 这就是镜像里为什么装 `tini`。
+所以 Docker 场景下请保持 `ENTRYPOINT` 不动，把启动命令写在 `CMD` 里。
 
 两个顺序细节都是踩出来的：
 

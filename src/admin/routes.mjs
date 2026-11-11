@@ -21,7 +21,51 @@ import { modelsResponse } from '../openai/response.mjs';
  *   （和服务本体的鉴权策略一致，默认 127.0.0.1 只监听本机）。
  */
 
-/** 允许在后台里修改的配置项（写回 .env，重启后生效） */
+/**
+ * 判断当前进程是**怎么跑起来的**，决定「重启」走哪条路径。
+ *
+ * 三种形态的启动入口完全不同：
+ *
+ *   'source'    源码运行（`npm start` / `node src/index.mjs`）
+ *               → execPath 是 node，可以带脚本参数，交给 scripts/server-ctl.mjs
+ *   'packaged'  打包而成的单 exe（Node SEA）
+ *               → execPath 是 cz-dsapi.exe，不接受脚本参数，只能重新拉起自己
+ *   'docker'    容器里（`node src/index.mjs` 作为 1 号进程）
+ *               → execPath 也是 node，**但绝不能走 server-ctl**
+ *
+ * 为什么容器必须单独判：`scripts/server-ctl.mjs` 是为源码运行写的，
+ * 在容器里每一环都不成立 ——
+ *   - `down` 会 SIGTERM 掉 **1 号进程**（容器主进程），容器当场退出，
+ *     `up` 那段根本没机会执行，Docker 只会看到一个"无故退出"的容器；
+ *   - `listenerPids()` / `supervisorOf()` 依赖 `pgrep` / `ps`，slim 镜像里没有；
+ *   - `restart` 的语义是"交给外部重新拉起"，而容器里没有外部 ——
+ *     PID 1 死了就是死了。
+ * 所以容器里沿用 packaged 的路径：自己 spawn 一个新进程，再优雅退出。
+ *
+ * 容器判定同时接受两个信号（任一成立即可），避免漏判：
+ *   - `/.dockerenv` 存在（Docker 官方行为，最直接）
+ *   - `CZDSAPI_DOCKER=1`（镜像里显式设置，给非标准运行时兜底）
+ */
+export function detectRuntimeMode({ execPath = process.execPath, env = process.env, existsSync = fs.existsSync } = {}) {
+  // 打包 exe：execPath 不再是 node。
+  // CZDSAPI_ROOT 是打包入口显式设置的（SEA 里 import.meta.dirname 不可用），最可靠。
+  if (env.CZDSAPI_ROOT) return 'packaged';
+  if (!/node(\.exe)?$/i.test(path.basename(execPath))) return 'packaged';
+
+  // 容器：必须在"看起来像源码运行"之前判断，否则会去调根本不存在的 server-ctl
+  if (env.CZDSAPI_DOCKER === '1') return 'docker';
+  try {
+    if (existsSync('/.dockerenv')) return 'docker';
+  } catch {
+    /* 权限问题之类，当作不是 */
+  }
+
+  return 'source';
+}
+
+/**
+ * 允许在后台里修改的配置项（写回 .env，重启后生效）
+ */
 const ENV_SCHEMA = [
   { key: 'ENGINE', label: '引擎', type: 'select', options: ['direct', 'auto', 'browser'], help: 'direct 直连最快；browser 用 Playwright 驱动真实网页' },
   { key: 'DEEPSEEK_THINKING', label: '深度思考', type: 'select', options: ['always', 'auto', 'never'], help: 'always 默认打开；请求里传 thinking:false 可单次关闭' },
@@ -510,7 +554,7 @@ export function createAdminHandler({ config, logger, web, server }) {
   /**
    * 重启服务。
    *
-   * 两种运行形态必须分开处理 —— 它们连"去哪里找启动入口"都不一样：
+   * 三种运行形态必须分开处理 —— 它们连"去哪里找启动入口"都不一样：
    *
    *   源码运行：交给 scripts/server-ctl.mjs（down→up，带 pid 文件、pgrep 兜底、
    *             pm2/systemd 检测）。这些工具都是 Unix 风格的，且 process.execPath
@@ -519,15 +563,16 @@ export function createAdminHandler({ config, logger, web, server }) {
    *   打包 exe：process.execPath 是 cz-dsapi.exe，**不接受脚本参数**，也没有 pgrep/ps，
    *             SIGTERM 在 Windows 上也不可靠。所以自己实现：detached 拉起一个新的
    *             exe（继承环境变量，cwd 设为项目根），等它起来后再退出本进程。
-   *             顺序很重要 —— 先起新的会撞端口，先退旧的会丢请求；
-   *             这里用"新进程先等旧进程让出端口"的方式：spawn 前先 close server，
-   *             让端口立刻空出来，再启动。
+   *
+   *   Docker  ：也是自己拉起自己，和打包 exe 同一条路径 ——
+   *             容器里没有 pgrep/ps，且 1 号进程一死容器就退出，绝对不能交给 server-ctl
+   *             （详见 detectRuntimeMode 的注释）。
    */
   async function restartServer() {
-    const packaged = Boolean(process.env.CZDSAPI_ROOT) || !/node(\.exe)?$/i.test(path.basename(process.execPath));
+    const mode = detectRuntimeMode();
 
-    if (packaged) {
-      return restartPackaged();
+    if (mode === 'packaged' || mode === 'docker') {
+      return restartSelf(mode);
     }
 
     if (!fs.existsSync(ctlScript)) {
@@ -554,25 +599,38 @@ export function createAdminHandler({ config, logger, web, server }) {
   }
 
   /**
-   * 打包版重启：直接把自己重新拉起来。
+   * 自己重启自己：打包 exe 与 Docker 容器共用。
    *
    * 步骤：
-   *   1. detached 启动同一个 exe，cwd/rootDir 不变，环境变量原样继承；
+   *   1. detached 启动一个新进程，cwd/rootDir 不变，环境变量原样继承；
    *   2. 关掉自己的 HTTP server 释放端口，然后走优雅退出。
    *
-   * 注意 exe 是 Node SEA 打的包，"可执行文件 + 无参数"就是完整的启动命令，
-   * 不需要（也不能）传 src/index.mjs —— 传了会被 SEA 当成用户参数。
+   * 两种形态的启动命令不同，但**都不能带脚本参数**：
+   *   - packaged：exe 是 Node SEA，"可执行文件 + 无参数"就是完整启动命令
+   *     （传 src/index.mjs 会被 SEA 当成用户参数）；
+   *   - docker  ：镜像的 CMD 就是 `node src/index.mjs`，execPath 是 node，
+   *     所以要显式补上 index.mjs，否则 node 会打开 REPL 并立刻退出。
+   *
+   * 注意：容器里 1 号进程退出 = 容器退出。新进程是**子进程**，旧进程退出后
+   * 它会被 tini 收养（tini 是镜像的 ENTRYPOINT，负责转发信号与回收子进程），
+   * 所以必须用 tini 而不是让 node 直接当 1 号来跑 —— 这也是镜像里为什么装 tini。
    */
-  async function restartPackaged() {
+  async function restartSelf(mode) {
     const exe = process.execPath;
+    const args = mode === 'docker' ? [path.join(rootDir, 'src', 'index.mjs')] : [];
 
-    log.info('收到后台重启请求（打包版），将直接重启可执行文件', { exe });
+    log.info(
+      mode === 'docker'
+        ? '收到后台重启请求（Docker），将重新拉起 node src/index.mjs'
+        : '收到后台重启请求（打包版），将直接重启可执行文件',
+      { exe, args },
+    );
 
     // 延迟动作，让 sendJson 先把响应 flush 回浏览器
     setTimeout(() => {
       let child;
       try {
-        child = spawn(exe, [], {
+        child = spawn(exe, args, {
           cwd: rootDir,
           detached: true,
           stdio: 'ignore',
