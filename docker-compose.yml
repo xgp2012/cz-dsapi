@@ -24,72 +24,74 @@ services:
 
     ports:
       # 左边是宿主机端口，改了之后控制台地址也要跟着改
-      # 只想本机访问就写 "127.0.0.1:8787:8787"（配合下面 API_KEY 留空也相对安全）
+      # 只想本机访问就写 "127.0.0.1:8787:8787"
       - "8787:8787"
 
+    # environment 用「列表 + KEY=VALUE」写法。
+    # 另一种合法写法是映射（KEY: VALUE），但两者**不能混用** ——
+    # 混用会让整段 environment 退化成字符串，报 "expected <block end>, but found '<scalar>'"。
     environment:
       # ------------------------------ 必填 ------------------------------
       # ⚠️ API_KEY：容器默认监听 0.0.0.0，等于对所有能访问该端口的人开放。
       #    留空 = 任何人拿到地址就能白嫖你的号池额度。请务必改成强随机串。
       #    生成：openssl rand -hex 24
-      API_KEY=${CZ_API_KEY:?请设置 CZ_API_KEY，例如在 .env 里写 CZ_API_KEY=xxx}
+      - API_KEY=${CZ_API_KEY:?请设置 CZ_API_KEY，例如在 .env 里写 CZ_API_KEY=xxx}
 
       # 登录态（二选一，或都留空走控制台粘贴）：
       #   单个 token
-      DEEPSEEK_USER_TOKEN=${CZ_USER_TOKEN:-}
+      - DEEPSEEK_USER_TOKEN=${CZ_USER_TOKEN:-}
       #   号池：多个 token 用空格或逗号分隔
-      DEEPSEEK_USER_TOKENS=${CZ_USER_TOKENS:-}
+      - DEEPSEEK_USER_TOKENS=${CZ_USER_TOKENS:-}
 
       # ---------------------------- 引擎与模型 ----------------------------
       # direct：直连网页接口 + Go 解 PoW，最快、不吃内存（推荐）
       # browser：Playwright 驱动真实网页，慢但更贴近真人行为
-      ENGINE=direct
-      DEEPSEEK_THINKING=always
-      DEEPSEEK_SEARCH=false
-      DEFAULT_MODEL=deepseek-flash
+      - ENGINE=direct
+      - DEEPSEEK_THINKING=always
+      - DEEPSEEK_SEARCH=false
+      - DEFAULT_MODEL=deepseek-flash
 
       # ---------------------------- 运行与并发 ----------------------------
       # 直连引擎靠号池扛限流，不是靠放慢。多号时可以适当提高。
-      CONCURRENCY=4
-      QUEUE_LIMIT=64
-      REQUEST_TIMEOUT_MS=240000
-      ACCOUNT_COOLDOWN_MS=60000
+      - CONCURRENCY=4
+      - QUEUE_LIMIT=64
+      - REQUEST_TIMEOUT_MS=240000
+      - ACCOUNT_COOLDOWN_MS=60000
       # 多号时把并发摊开，避免全压在一个号上撞风控；0 = 不限
-      MAX_INFLIGHT_PER_ACCOUNT=2
+      - MAX_INFLIGHT_PER_ACCOUNT=2
 
       # 账号后台探活：每 10 分钟复检一个停用/冷却中的号，通过就自动恢复。
       # token 失效后不需要人工重启进程 —— 这是容器里最省心的一项。
-      ACCOUNT_PROBE_INTERVAL_MS=600000
+      - ACCOUNT_PROBE_INTERVAL_MS=600000
 
       # 优雅关闭：必须小于 docker stop 的宽限（下面 stop_grace_period）。
       # 留 2s 余量，否则会被 SIGKILL，Chromium 子进程变孤儿。
-      SHUTDOWN_TIMEOUT_MS=8000
+      - SHUTDOWN_TIMEOUT_MS=8000
 
       # ------------------------------ 安全 ------------------------------
-      RATE_LIMIT_ENABLED=true
-      RATE_LIMIT_PER_MINUTE=60
-      # 前面挂了 Nginx/Traefik 等反代才需要打开，直连时保持注释（否则可被伪造 XFF 绕过限流）
-      # TRUST_PROXY=loopback
+      - RATE_LIMIT_ENABLED=true
+      - RATE_LIMIT_PER_MINUTE=60
+      # 前面挂了 Nginx/Traefik 等反代才需要打开，直连时保持注释
+      # （否则客户端可伪造 X-Forwarded-For 绕过限流）
+      # - TRUST_PROXY=loopback
       # 允许跨域的前端来源，默认 * 适合大多数 OpenAI SDK；收紧成具体域名更安全
-      # CORS_ORIGIN=*
+      # - CORS_ORIGIN=*
 
       # ------------------------------ 其它 ------------------------------
-      LOG_LEVEL=info
-      TZ=Asia/Shanghai
+      - LOG_LEVEL=info
+      - TZ=Asia/Shanghai
 
     volumes:
       # 号池（auth.json）、日志、截图产物都在这里。
       # ⚠️ 别省：不挂卷重建容器，号池就丢了，得重新粘一遍 token。
       - cz-data:/app/data
-      # 如果你希望「设置」页能保存配置，可以挂一个可写的 .env（默认不挂）：
-      # - ./.env.container:/app/.env
 
-    # ✅ 关键：必须 >= SHUTDOWN_TIMEOUT_MS，给优雅关闭留出时间。
-    #    默认 10s 也能工作，这里显式写出来是为了让两者关系一目了然。
+    # ✅ 关键：必须 > SHUTDOWN_TIMEOUT_MS，给优雅关闭留出时间。
+    #    默认 10s 也能工作，这里显式写出来是为了让两者的关系一目了然。
     stop_grace_period: 15s
 
     healthcheck:
-      # 镜像自带 HEALTHCHECK，这里再写一遍只是为了让 compose 的 depends_on 能引用
+      # 镜像自带 HEALTHCHECK，这里再写一遍是为了让 compose 的 depends_on 能引用
       test:
         - CMD
         - node
@@ -115,21 +117,16 @@ services:
     #     limits:
     #       memory: 1g
 
-    # ---------------------------- 时区与字体（可选） ----------------------------
-    # 保持默认即可：镜像里已装 tzdata 并设 TZ=Asia/Shanghai。
-    # 需要额外字体（比如中文渲染/截图）时挂载：
-    # - /usr/share/fonts:/usr/share/fonts:ro
-
-    # ---------------------------- 网络模式（可选） ----------------------------
-    # 如果你要让容器访问宿主机上的代理（BROWSER_ARGS=--proxy-server=...）：
+    # ---------------------------- 网络（可选） ----------------------------
+    # 要让容器访问宿主机上的代理（BROWSER_ARGS=--proxy-server=...）时打开：
     # extra_hosts:
     #   - "host.docker.internal:host-gateway"
 
 volumes:
-  cz-data:
-    # 想指定落盘位置（比如放到大盘上）就改成：
-    # driver: local
-    # driver_opts:
-    #   type: none
-    #   o: bind
-    #   device: /srv/cz-dsapi/data
+  # 命名卷。想指定落盘位置（比如放到大盘上）就改成 bind 形式：
+  #   driver: local
+  #   driver_opts:
+  #     type: none
+  #     o: bind
+  #     device: /srv/cz-dsapi/data
+  cz-data: {}
