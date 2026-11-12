@@ -31,54 +31,31 @@ services:
     # 另一种合法写法是映射（KEY: VALUE），但两者**不能混用** ——
     # 混用会让整段 environment 退化成字符串，报 "expected <block end>, but found '<scalar>'"。
     environment:
+      # ---------------------------------------------------------------------
+      # 这里刻意只保留「必须在容器启动前确定」的项。
+      #
+      # 其余所有可调配置（引擎、并发、超时、深度思考、浏览器参数…共 51 项）
+      # 都请在**控制台「设置」页**改 —— 保存在数据卷的 settings.json 里，
+      # 重启服务即生效。网页设置的优先级高于这里的 environment，
+      # 所以即便你在下面也写了同名项，网页上的值最终仍会胜出。
+      #
+      # 保留在这里的三类：
+      #   1. API_KEY / token：属于凭据，不该出现在可被网页覆盖的明文文件里；
+      #   2. PORT / HOST / DATA_DIR：容器端口映射与卷位置，改了必须重建容器；
+      #   3. TZ：进程启动时就决定，网页改它没有意义。
+      # ---------------------------------------------------------------------
+
       # ------------------------------ 必填 ------------------------------
       # ⚠️ API_KEY：容器默认监听 0.0.0.0，等于对所有能访问该端口的人开放。
       #    留空 = 任何人拿到地址就能白嫖你的号池额度。请务必改成强随机串。
       #    生成：openssl rand -hex 24
       - API_KEY=${CZ_API_KEY:?请设置 CZ_API_KEY，例如在 .env 里写 CZ_API_KEY=xxx}
 
-      # 登录态（二选一，或都留空走控制台粘贴）：
-      #   单个 token
+      # 登录态（二选一，或都留空走控制台的「账号」页粘贴）
       - DEEPSEEK_USER_TOKEN=${CZ_USER_TOKEN:-}
-      #   号池：多个 token 用空格或逗号分隔
       - DEEPSEEK_USER_TOKENS=${CZ_USER_TOKENS:-}
 
-      # ---------------------------- 引擎与模型 ----------------------------
-      # direct：直连网页接口 + Go 解 PoW，最快、不吃内存（推荐）
-      # browser：Playwright 驱动真实网页，慢但更贴近真人行为
-      - ENGINE=direct
-      - DEEPSEEK_THINKING=always
-      - DEEPSEEK_SEARCH=false
-      - DEFAULT_MODEL=deepseek-flash
-
-      # ---------------------------- 运行与并发 ----------------------------
-      # 直连引擎靠号池扛限流，不是靠放慢。多号时可以适当提高。
-      - CONCURRENCY=4
-      - QUEUE_LIMIT=64
-      - REQUEST_TIMEOUT_MS=240000
-      - ACCOUNT_COOLDOWN_MS=60000
-      # 多号时把并发摊开，避免全压在一个号上撞风控；0 = 不限
-      - MAX_INFLIGHT_PER_ACCOUNT=2
-
-      # 账号后台探活：每 10 分钟复检一个停用/冷却中的号，通过就自动恢复。
-      # token 失效后不需要人工重启进程 —— 这是容器里最省心的一项。
-      - ACCOUNT_PROBE_INTERVAL_MS=600000
-
-      # 优雅关闭：必须小于 docker stop 的宽限（下面 stop_grace_period）。
-      # 留 2s 余量，否则会被 SIGKILL，Chromium 子进程变孤儿。
-      - SHUTDOWN_TIMEOUT_MS=8000
-
-      # ------------------------------ 安全 ------------------------------
-      - RATE_LIMIT_ENABLED=true
-      - RATE_LIMIT_PER_MINUTE=60
-      # 前面挂了 Nginx/Traefik 等反代才需要打开，直连时保持注释
-      # （否则客户端可伪造 X-Forwarded-For 绕过限流）
-      # - TRUST_PROXY=loopback
-      # 允许跨域的前端来源，默认 * 适合大多数 OpenAI SDK；收紧成具体域名更安全
-      # - CORS_ORIGIN=*
-
-      # ------------------------------ 其它 ------------------------------
-      - LOG_LEVEL=info
+      # ---------------------------- 容器基础 ----------------------------
       - TZ=Asia/Shanghai
 
     volumes:

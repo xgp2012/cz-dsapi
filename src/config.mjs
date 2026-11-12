@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 
 import { parseEnvText, resolveExecutable } from './util.mjs';
+import { loadSettings, overlaySettings, settingsPath } from './settings-store.mjs';
 
 /**
  * 项目根目录。
@@ -26,6 +27,21 @@ function loadDotEnv(file) {
 }
 
 loadDotEnv(path.join(ROOT, '.env'));
+
+/**
+ * 配置优先级：**网页设置 > 环境变量 > .env > 内置默认值**。
+ *
+ * .env 已经在上一步灌进 process.env，所以前三层在这里合成：
+ *   process.env（含 compose 的 environment 与 .env）+ settings.json 的覆盖。
+ *
+ * 为什么让网页设置压过环境变量：
+ * 用户要求「所有配置网页可改」。若环境变量优先，compose 里写过的键
+ * 在网页上改了永远不生效，页面却显示「已保存」—— 这种静默失败比报错更糟。
+ *
+ * 注意顺序：settings.json 存放在 dataDir 里，而 dataDir 由 DATA_DIR 决定。
+ * 先按「.env + 环境变量」算出 dataDir 的位置，再去读设置文件；
+ * 不能反过来，否则 DATA_DIR 自己被网页改过时会读到错误路径。
+ */
 
 const bool = (value, fallback) => {
   if (value === undefined || value === null || value === '') return fallback;
@@ -78,7 +94,28 @@ function resolveTokens(env, authFile) {
   return [...new Set(list)];
 }
 
-export function loadConfig(env = process.env) {
+/**
+ * 读取「网页设置」文件位置。
+ *
+ * 单独导出：admin 路由要用它做保存目标，诊断信息也要显示它到底在哪。
+ * 位置取决于 DATA_DIR，而 DATA_DIR 本身也可能被网页改过 ——
+ * 那种情况要重启后才生效（端口/数据目录这类不能在运行时搬家）。
+ */
+export function userSettingsFile(env = process.env) {
+  const dir = path.resolve(ROOT, env.DATA_DIR || 'data');
+  return settingsPath(dir);
+}
+
+export function loadConfig(rawEnv = process.env) {
+  // 先按「环境变量 + .env」定位数据目录，再去读网页保存的设置，
+  // 然后用合并后的视图解析其余所有项（网页设置覆盖环境变量）。
+  const initialDataDir = path.resolve(ROOT, expandHome(str(rawEnv.DATA_DIR, 'data')));
+  const settingsFile = settingsPath(initialDataDir);
+
+  const settings = loadSettings(settingsFile);
+  const env = overlaySettings(rawEnv, settings.values);
+
+  // dataDir / authFile 也要跟着网页设置走（DATA_DIR 允许在网页上改）
   const dataDir = path.resolve(ROOT, expandHome(str(env.DATA_DIR, 'data')));
   fs.mkdirSync(dataDir, { recursive: true });
   const authFile = path.join(dataDir, 'auth.json');
@@ -92,6 +129,9 @@ export function loadConfig(env = process.env) {
     rootDir: ROOT,
     dataDir,
     authFile,
+    // 供后台页面显示「配置存在哪、有没有读坏」
+    settingsFile: settingsPath(dataDir),
+    settingsBroken: settings.broken,
     logLevel: str(env.LOG_LEVEL, 'info'),
     server: {
       host: str(env.HOST, '127.0.0.1'),

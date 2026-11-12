@@ -1533,14 +1533,14 @@ runtime  node:22-bookworm-slim   apt 运行时库 + 生产依赖 + chromium-head
 
 `HOST=0.0.0.0` 是**必须**的：容器里只监听 `127.0.0.1` 的话端口映射不出去。
 
-#### 镜像里的可写路径只有两处
+#### 镜像里的可写路径
 
 | 路径 | 内容 | 是否需挂卷 |
 |---|---|---|
-| `/app/data/` | `auth.json`（号池）、`server.log`、`artifacts/`（截图）、`font-cache/` | **是**，否则重建容器号池就丢 |
-| `/app/.env` | 「设置」页写回的配置 | **容器里写不了**，见下 |
+| `/app/data/` | `auth.json`（号池）、`settings.json`（网页设置）、`server.log`、`artifacts/`、`font-cache/` | **是**，否则重建容器号池和配置全丢 |
+| `/app/.env` | 只在源码部署时用；容器里**不参与**配置保存 | 否 |
 
-除这两处外 `/app` 全是 root 只读，进程以 `node`（uid 1000）运行。
+除 `data/` 外 `/app` 全是 root 只读，进程以 `node`（uid 1000）运行。
 `config.mjs#loadConfig` 里的 `fs.mkdirSync(dataDir)` 在目录已存在时不报错，
 所以 `DATA_DIR` 指向一个已 `chown` 好且挂载了卷的目录即可。
 
@@ -1548,27 +1548,64 @@ runtime  node:22-bookworm-slim   apt 运行时库 + 生产依赖 + chromium-head
 它们平时由进程运行期 `mkdir`，但挂载卷之后卷根的属主来自宿主机，
 不预先建好就会出现「第一次出错要截图 → EACCES」这种最难排查的组合。
 
-#### 容器里 `.env` 写不进去是设计，不是 bug
+#### 网页设置存在 `data/settings.json`（不再写 `.env`）
 
-「设置」页会把配置写回 `/app/.env`，而容器里 `/app` 是 root 只读、进程以 `node` 跑。
-直接写的结果是 `EACCES` → 500 + 堆栈，用户完全不知道该怎么办。
+早期版本把「设置」页写回 `/app/.env`，这在容器里有**两处**致命问题：
 
-现在 `envWritable()` 在写入前先探（先探文件、再探目录，两步都失败才判定只读），
-探不到就返回 **409 + `env_not_writable`**，并在消息里直接给出三条可照做的替代方案：
+| 问题 | 后果 |
+|---|---|
+| `/app` 是 root 只读，进程以 `node` 跑 | 写入 `EACCES` → 500 + 堆栈，用户完全不知道怎么办 |
+| 就算能写，`config.mjs` 里环境变量优先级高于 `.env` | compose 的 `environment` 已经占住那批键，写进 `.env` 的值被**静默忽略** |
 
+第二条更恶劣：页面提示「已保存」，重启后却没变化 —— 用户会怀疑整个配置系统坏了。
+（这两条是用户实测反馈「网页改了设置重启容器后能保存吗」时暴露的。）
+
+现在改为写 `data/settings.json`（实现见 `src/settings-store.mjs`）：
+
+- `data/` 是唯一需要挂卷的目录，配置跟着号池、日志走，一次挂卷全部持久化；
+- 它是我们自己的文件，格式由我们定，不受 compose 环境变量影响；
+- 文件是**扁平**的 JSON，键名与环境变量完全一致，出问题可直接手改：
+
+```json
+{ "ENGINE": "browser", "CONCURRENCY": "8", "LOG_LEVEL": "debug" }
 ```
-容器里的 .env 不可写（/app/.env）。这是预期行为：镜像中 /app 是只读的，配置应当通过环境变量传入。
-请改用以下任一方式，然后 docker restart 容器：
-  docker run 时加  -e KEY=VALUE
-  或在 docker-compose.yml 的 environment: 段里声明
-  或挂载一个可写目录：-v cz-dsapi-data:/app/data 后把配置写进 .env 再挂进来
-```
 
-`GET /admin/api/config` 同时返回 `writable` / `writableHint` / `runtimeMode`，
-前端据此把表单置灰并显示原因，而不是等用户点「保存」才吃到错误。
+**优先级：网页设置 > 环境变量 > `.env` > 内置默认值。**
 
-> 为什么用 409 而不是 500：这是**环境限制**，不是服务端故障。
-> 调用方按 409 处理才对（500 会被当成 bug 报上来）。
+这个顺序是刻意与旧行为相反的。若环境变量优先，compose 里写过的键在网页上改了
+永远不生效，页面还显示「已保存」—— 静默失败比直接报错更糟。
+
+几条实现上的取舍：
+
+| 决策 | 原因 |
+|---|---|
+| 原子写（临时文件 + `rename`） | 直接覆盖时若被 SIGKILL / 断电，会留下半截 JSON，用户所有配置一次性丢失 |
+| 文件损坏 → 当作「没有用户设置」且 `settingsBroken=true` | 绝不能让坏配置把服务卡在启动阶段，否则用户连控制台都打不开来修它 |
+| 只保留标量值 | 手改出嵌套结构时丢弃，避免把后续逻辑搞崩 |
+| 空值 = 删除该键 | 语义是「恢复默认」，否则用户永远没法清掉某项 |
+| 不修改 `process.env`，用 `overlaySettings` 生成合并视图 | 子进程（Chromium / ds-pow）继承的仍是原始环境，避免父子进程看到的配置不一致 |
+
+**密码类字段（`API_KEY`）的掩码保护**：页面显示 `••••••••`，用户只改别的项时
+浏览器会把掩码原样提交回来。若不识别，重启后鉴权 KEY 就变成了那串圆点，
+而用户毫不知情。`saveConfig` 里识别 `/^[•*]+$/` 并跳过该项（语义是"没改"，不是"清空"）。
+
+`GET /admin/api/config` 返回 `writable` / `writableHint` / `runtimeMode` / `settingsFile` / `broken`，
+前端据此置灰表单并说明原因，而不是等用户点保存才吃到 409。
+
+> 配置目录不可写时仍用 **409** 而不是 500：这是环境限制，不是服务端故障。
+
+配置页现在覆盖 **51 项**，分 8 组渲染（基础 / 运行与并发 / 长上下文 / 号池与限流 /
+服务与鉴权 / 直连特征 / 浏览器引擎 / 其它）。刻意**不放进网页**的只有三类：
+
+| 排除项 | 原因 |
+|---|---|
+| `POW_BIN` / `CHROMIUM_EXECUTABLE` / `CHROMIUM_DEPS_DIR` / `DATA_DIR` / `CZDSAPI_ROOT` | 路径类，改成不存在的值会让下次启动直接失败；属于部署时决定 |
+| `DEEPSEEK_USER_TOKEN*` | 有独立的「账号」页专门管理，不在这里重复 |
+| `PORT` / `HOST` 虽在页面里，但标注了「改完重启才生效」 | 监听地址无法热切 |
+
+> `ENV_SCHEMA` 与 `currentEffective` 必须**一一对应**：漏一个，那项在页面上就显示空白，
+> 用户以为没设置过，保存时还可能被空串覆盖。开发中真实发生过（schema 加到 51 项时
+> mapping 还停在 19 项），所以 `test/admin-settings.test.mjs` 里有一条断言专门守这个一致性。
 
 #### 容器的其他特异性问题
 

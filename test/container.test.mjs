@@ -117,16 +117,36 @@ test('目录只读时能判定 .env 不可写，而不是抛异常', () => {
   }
 });
 
-test('容器镜像里 .env 不可写是预期：必须有可操作的环境变量提示', () => {
+/**
+ * 容器里「网页改配置」是否可用。
+ *
+ * 历史：早期版本写回 /app/.env，在容器里必然失败（root 只读），
+ * 于是这里断言过 env_not_writable 这条错误码。
+ *
+ * 现在改成了写 data/settings.json（数据卷可写），所以这个能力在容器里**应该可用**，
+ * 旧断言反而成了过时的枷锁。下面锁的是新契约：
+ *   - 保存目标在数据目录里，而不是只读的 /app；
+ *   - 权限不足时仍然返回 409（而不是 500）。
+ */
+test('配置保存在数据目录（容器里可写），而不是只读的 /app/.env', () => {
   const source = fs.readFileSync(
     path.join(import.meta.dirname, '..', 'src', 'admin', 'routes.mjs'),
     'utf8',
   );
-  assert.match(source, /env_not_writable/, '要返回专门的错误码，前端才能识别');
-  assert.match(source, /-e KEY=VALUE/, '提示里要给出 docker run 的写法');
-  assert.match(source, /environment:/, '提示里要给出 docker-compose 的写法');
-  // 必须是 409 而不是 500：这是环境限制，不是服务端故障
-  assert.match(source, /new ApiError\(409,\s*writable\.message/, '只读应该是 409 冲突，不是 500');
+  assert.match(source, /const target = config\.settingsFile/, '保存目标必须是 settingsFile');
+  assert.doesNotMatch(source, /envFile\s*=\s*path\.join\(rootDir, '\.env'\)[\s\S]{0,200}writeFileSync/,
+    '不能再往 /app/.env 写');
+});
+
+test('配置目录不可写时返回 409 并给出可操作的提示', () => {
+  const source = fs.readFileSync(
+    path.join(import.meta.dirname, '..', 'src', 'admin', 'routes.mjs'),
+    'utf8',
+  );
+  assert.match(source, /settings_not_writable/, '要有专门的错误码');
+  assert.match(source, /cz-dsapi-data:\/app\/data/, '提示里要给出数据卷的挂载写法');
+  // 409 而不是 500：这是环境限制，不是服务端故障
+  assert.match(source, /new ApiError\(\s*409,/, '不可写应该是 409 冲突，不是 500');
 });
 
 test('控制台配置页能知道是否可写', () => {
@@ -134,7 +154,8 @@ test('控制台配置页能知道是否可写', () => {
     path.join(import.meta.dirname, '..', 'src', 'admin', 'routes.mjs'),
     'utf8',
   );
-  assert.match(source, /writable: writable\.ok/, 'buildConfig 要暴露 writable');
+  assert.match(source, /const writable = settingsWritable\(config\.settingsFile\)/, '要用 settingsWritable 探测');
+  assert.match(source, /writable[,:]/, 'buildConfig 要暴露 writable');
   assert.match(source, /writableHint:/, '要带上不可写的原因，前端才能说明白');
 });
 

@@ -43,6 +43,28 @@ export default function Settings() {
     [values, initial],
   );
 
+  const writable = config?.writable !== false;
+
+  /**
+   * 按后端 schema 里的 group 字段分组渲染。
+   * 51 项平铺成一列太难找，分组后每组之间还有小标题。
+   * 组顺序按 schema 里首次出现的顺序（也就是后端的排列顺序），不另立一套。
+   */
+  const groups = useMemo(() => {
+    const schema = config?.schema ?? [];
+    const order = [];
+    const map = new Map();
+    for (const item of schema) {
+      const name = item.group || '其它';
+      if (!map.has(name)) {
+        map.set(name, []);
+        order.push(name);
+      }
+      map.get(name).push(item);
+    }
+    return order.map((name) => ({ name, items: map.get(name) }));
+  }, [config]);
+
   const setValue = (key, value) => setValues((prev) => ({ ...prev, [key]: value }));
 
   const save = async () => {
@@ -124,17 +146,32 @@ export default function Settings() {
       <div className="page-head">
         <div>
           <h1>设置</h1>
-          <p className="muted">改完会写回项目根目录的 .env，重启服务后生效。没写进 .env 的项用默认值，这里显示的是当前生效值。</p>
+          <p className="muted">
+            改完保存在数据目录的 settings.json，重启服务后生效。这里显示的是当前生效值；
+            清空某一项等于恢复默认。
+          </p>
         </div>
         <div className="page-actions">
           <Btn variant="tonal" icon="refresh" onClick={load}>
             重新读取
           </Btn>
-          <Btn variant="filled" icon="save" loading={saving} disabled={!changedKeys.length} onClick={save}>
+          <Btn variant="filled" icon="save" loading={saving} disabled={!changedKeys.length || !writable} onClick={save}>
             保存{changedKeys.length ? `（${changedKeys.length} 项）` : ''}
           </Btn>
         </div>
       </div>
+
+      {config.broken ? (
+        <Banner tone="warn" icon="warning">
+          settings.json 读取失败，当前显示的是环境变量 / 默认值。保存一次即可覆盖修复。
+        </Banner>
+      ) : null}
+
+      {!writable ? (
+        <Banner tone="warn" icon="lock">
+          {config.writableHint || '配置目录不可写，无法保存。'}
+        </Banner>
+      ) : null}
 
       {changedKeys.length ? (
         <Banner tone="warn" icon="edit_note">
@@ -142,19 +179,26 @@ export default function Settings() {
         </Banner>
       ) : null}
 
-      <Card title="配置项" subtitle={config.envFile}>
-        <div className="form-grid">
-          {config.schema.map((item) => (
-            <div className="field" key={item.key}>
-              <span className="field-label">
-                {item.label} <span className="mono muted">{item.key}</span>
-              </span>
-              <SettingControl item={item} value={values[item.key] ?? ''} onChange={(value) => setValue(item.key, value)} />
-              {item.help ? <span className="field-help">{item.help}</span> : null}
-            </div>
-          ))}
-        </div>
-      </Card>
+      {groups.map(({ name, items }) => (
+        <Card key={name} title={name} subtitle={name === groups[0].name ? config.settingsFile : undefined}>
+          <div className="form-grid">
+            {items.map((item) => (
+              <div className="field" key={item.key}>
+                <span className="field-label">
+                  {item.label} <span className="mono muted">{item.key}</span>
+                </span>
+                <SettingControl
+                  item={item}
+                  value={values[item.key] ?? ''}
+                  disabled={!writable}
+                  onChange={(value) => setValue(item.key, value)}
+                />
+                {item.help ? <span className="field-help">{item.help}</span> : null}
+              </div>
+            ))}
+          </div>
+        </Card>
+      ))}
 
       <Card title="服务操作">
         <div className="row">

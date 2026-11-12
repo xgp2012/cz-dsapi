@@ -152,9 +152,10 @@ docker run -d --name cz-dsapi \
 > `http://localhost:8787/admin/`（端口已映射），远程服务器则用 `http://<服务器IP>:8787/admin/`。
 > 启动日志里也会把这一点打印出来。
 
-> **容器里「设置」页不能保存。** 镜像中 `/app` 是只读的，`.env` 写不进去。
-> 要么在 `docker run` 时用 `-e KEY=VALUE`，要么写进 compose 的 `environment:`。
-> 控制台会把表单置灰并说明原因，不会让你点了保存才发现失败。
+> **容器里「设置」页是能用的。** 配置保存在数据卷里的 `settings.json`，
+> 点保存后重启服务即生效 —— 不需要改 compose、也不需要重建容器。
+> （早期版本写 `/app/.env`，在容器里必然失败；现在改到数据目录了。）
+> 优先级是 **网页设置 > 环境变量**，所以你在 compose 里写过的项，网页上改了也会生效。
 
 > **务必设 `API_KEY`。** 容器默认监听 `0.0.0.0`，等于对**所有能访问该端口的人**开放。
 > 没设时启动日志会明确警告；如果端口映射到了公网，没 key 就是白送额度。
@@ -565,9 +566,9 @@ npm run auth -- --list      # 查看号池（token 打码）
 | `POST /admin/api/accounts` | 保存 token（`{tokens, mode: append\|replace}`） |
 | `POST /admin/api/accounts/verify` | 逐条校验登录态（会真的发一条最短消息） |
 | `POST /admin/api/accounts/remove` | 删除已保存 token（`{index}`，1 起） |
-| `GET /admin/api/config` · `PUT /admin/api/config` | 读 / 写项目根目录 `.env`（重启后生效） |
+| `GET /admin/api/config` · `PUT /admin/api/config` | 读 / 写 `data/settings.json`（51 项，重启后生效） |
 | `GET /admin/api/logs?lines=300` | 读 `data/server.log` 尾部 |
-| `POST /admin/api/restart` | 调 `server-ctl restart` 重启服务 |
+| `POST /admin/api/restart` | 重启服务（源码 / 打包 / 容器三种形态各有对应路径） |
 
 > 静态页面本身公开，`/admin/api/*` 才鉴权。浏览器端在首次 401 时弹出输入框，
 > key 保存在 localStorage（`cz-dsapi-admin-api-key`），右上角钥匙图标可修改 / 清除。
@@ -613,7 +614,9 @@ npm run auth -- --list      # 查看号池（token 打码）
 | `ACCOUNT_PROBE_INTERVAL_MS` | `600000` | 后台探活间隔：复检一个停用/冷却中的账号，通过就自动恢复；`0` 关闭（最小 60000） |
 | `IDLE_SHUTDOWN_MS` | `900000` | 浏览器引擎空闲回收 |
 
-上面这些（以及日志级别、并发、超时等）大多可以在网页控制台的「设置」页直接改，写回 `.env` 后重启生效。
+上面这些（以及引擎、并发、超时、浏览器参数等共 **51 项**）大多可以在网页控制台的「设置」页直接改，
+保存在数据目录的 `settings.json`，重启后生效，不需要编辑器也不需要终端。
+优先级是 **网页设置 > 环境变量 > `.env` > 默认值**，所以网页上改过的项会压过环境变量。
 完整列表见 [.env.example](.env.example)。
 
 ---

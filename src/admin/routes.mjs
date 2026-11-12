@@ -4,10 +4,10 @@ import { spawn } from 'node:child_process';
 
 import { ApiError } from '../errors.mjs';
 import { escapeHtml, readJsonBody, requireApiKey, sendHtml, sendJson } from '../http.mjs';
-import { parseEnvText } from '../util.mjs';
 import { loadTokens, maskToken, normalizeUserToken, saveTokens } from '../auth.mjs';
 import { createEngine } from '../engine.mjs';
 import { modelsResponse } from '../openai/response.mjs';
+import { SETTINGS_FILENAME, loadSettings, saveSettings, settingsWritable } from '../settings-store.mjs';
 
 /**
  * 后台管理接口 + 静态页面托管。
@@ -64,34 +64,84 @@ export function detectRuntimeMode({ execPath = process.execPath, env = process.e
 }
 
 /**
- * 允许在后台里修改的配置项（写回 .env，重启后生效）
+ * 允许在后台里修改的配置项（保存到 data/settings.json，重启后生效）。
+ *
+ * 覆盖原则：**凡是用户有理由调的都放进来**，只排除两类——
+ *
+ *   1. 路径/环境类（POW_BIN、CHROMIUM_EXECUTABLE、CZDSAPI_ROOT、DATA_DIR）：
+ *      网页上改成不存在的路径只会让服务下次启动直接失败，
+ *      而且这类值天然属于"部署时决定"，该由环境变量管。
+ *   2. 令牌类（DEEPSEEK_USER_TOKEN*）：有独立的「账号」页专门管理，不在这里重复。
+ *
+ * 顺序按「最常调 → 最少调」排，因为页面是按这个顺序渲染的。
  */
 const ENV_SCHEMA = [
-  { key: 'ENGINE', label: '引擎', type: 'select', options: ['direct', 'auto', 'browser'], help: 'direct 直连最快；browser 用 Playwright 驱动真实网页' },
-  { key: 'DEEPSEEK_THINKING', label: '深度思考', type: 'select', options: ['always', 'auto', 'never'], help: 'always 默认打开；请求里传 thinking:false 可单次关闭' },
-  { key: 'DEEPSEEK_SEARCH', label: '智能搜索', type: 'boolean', help: '让网页版默认打开「智能搜索」' },
-  { key: 'DEFAULT_MODEL', label: '默认模型名', type: 'text', help: '请求没写 model 时使用的名字' },
-  { key: 'LOG_LEVEL', label: '日志级别', type: 'select', options: ['error', 'warn', 'info', 'debug', 'trace'] },
-  { key: 'CONCURRENCY', label: '并发数', type: 'number', min: 1, max: 64 },
-  { key: 'QUEUE_LIMIT', label: '排队上限', type: 'number', min: 1, max: 4096 },
-  { key: 'REQUEST_TIMEOUT_MS', label: '单次超时（毫秒）', type: 'number', min: 1000 },
-  { key: 'FIRST_TOKEN_TIMEOUT_MS', label: '首字超时（毫秒）', type: 'number', min: 1000 },
-  { key: 'MAX_PROMPT_CHARS', label: '输入框上限（字符）', type: 'number', min: 1000 },
-  { key: 'MAX_ATTACHMENT_CHARS', label: '附件上限（字符）', type: 'number', min: 1000 },
-  { key: 'OVERFLOW_TO_ATTACHMENT', label: '超长转附件', type: 'boolean', help: '关掉后超长上下文直接返回 413' },
-  { key: 'WARMUP', label: '启动时预热', type: 'boolean' },
-  { key: 'SAVE_ARTIFACTS', label: '保存调试产物', type: 'boolean' },
-  { key: 'ACCOUNT_COOLDOWN_MS', label: '限流冷却（毫秒）', type: 'number', min: 1000 },
-  { key: 'HOST', label: '监听地址', type: 'text', help: '改完重启才生效，建议保持 127.0.0.1' },
-  { key: 'PORT', label: '监听端口', type: 'number', min: 1, max: 65535, help: '改完重启才生效' },
-  { key: 'API_KEY', label: 'API Key', type: 'password', help: '设置后 API 和后台接口都会要求鉴权，留空表示不鉴权' },
+  { key: 'ENGINE', group: '基础', label: '引擎', type: 'select', options: ['direct', 'auto', 'browser'], help: 'direct 直连最快；browser 用 Playwright 驱动真实网页' },
+  { key: 'DEEPSEEK_THINKING', group: '基础', label: '深度思考', type: 'select', options: ['always', 'auto', 'never'], help: 'always 默认打开；请求里传 thinking:false 可单次关闭' },
+  { key: 'DEEPSEEK_SEARCH', group: '基础', label: '智能搜索', type: 'boolean', help: '让网页版默认打开「智能搜索」' },
+  { key: 'DEFAULT_MODEL', group: '基础', label: '默认模型名', type: 'text', help: '请求没写 model 时使用的名字' },
+  { key: 'LOG_LEVEL', group: '基础', label: '日志级别', type: 'select', options: ['error', 'warn', 'info', 'debug', 'trace'] },
+  { key: 'CONCURRENCY', group: '运行与并发', label: '并发数', type: 'number', min: 1, max: 64 },
+  { key: 'QUEUE_LIMIT', group: '运行与并发', label: '排队上限', type: 'number', min: 1, max: 4096 },
+  { key: 'REQUEST_TIMEOUT_MS', group: '运行与并发', label: '单次超时（毫秒）', type: 'number', min: 1000 },
+  { key: 'FIRST_TOKEN_TIMEOUT_MS', group: '运行与并发', label: '首字超时（毫秒）', type: 'number', min: 1000 },
+  { key: 'MAX_PROMPT_CHARS', group: '长上下文', label: '输入框上限（字符）', type: 'number', min: 1000 },
+  { key: 'MAX_ATTACHMENT_CHARS', group: '长上下文', label: '附件上限（字符）', type: 'number', min: 1000 },
+  { key: 'OVERFLOW_TO_ATTACHMENT', group: '长上下文', label: '超长转附件', type: 'boolean', help: '关掉后超长上下文直接返回 413' },
+  { key: 'WARMUP', group: '其它', label: '启动时预热', type: 'boolean' },
+  { key: 'SAVE_ARTIFACTS', group: '其它', label: '保存调试产物', type: 'boolean' },
+  { key: 'ACCOUNT_COOLDOWN_MS', group: '号池与限流', label: '限流冷却（毫秒）', type: 'number', min: 1000 },
+  { key: 'HOST', group: '服务与鉴权', label: '监听地址', type: 'text', help: '改完重启才生效，建议保持 127.0.0.1' },
+  { key: 'PORT', group: '服务与鉴权', label: '监听端口', type: 'number', min: 1, max: 65535, help: '改完重启才生效' },
+  { key: 'API_KEY', group: '服务与鉴权', label: 'API Key', type: 'password', help: '设置后 API 和后台接口都会要求鉴权，留空表示不鉴权' },
   {
     key: 'ACCOUNT_PROBE_INTERVAL_MS',
+    group: '号池与限流',
     label: '账号探活间隔（毫秒）',
     type: 'number',
     min: 60000,
     help: '每隔多久复检一个停用/冷却中的账号；探活通过就自动恢复。0 = 关闭',
   },
+
+  /* ------------------------ 号池与限流 ------------------------ */
+  { key: 'MAX_INFLIGHT_PER_ACCOUNT', group: '号池与限流', label: '单号并发上限', type: 'number', min: 0, help: '0 = 不限（纯轮询）；多号时把并发摊开，避免全压一个号撞风控' },
+  { key: 'MAX_COOLDOWN_WAIT_MS', group: '号池与限流', label: '冷却最长等待（毫秒）', type: 'number', min: 0, help: '超过就直接返回 429，不再等' },
+  { key: 'RATE_LIMIT_ENABLED', group: '号池与限流', label: '入口限流', type: 'boolean', help: '按客户端 IP 的令牌桶，流量还没打到上游就先挡' },
+  { key: 'RATE_LIMIT_PER_MINUTE', group: '号池与限流', label: '限流突发数（每分钟）', type: 'number', min: 1 },
+  { key: 'RATE_LIMIT_REFILL_PER_SEC', group: '号池与限流', label: '限流补充速率（每秒）', type: 'number', min: 0 },
+  { key: 'RATE_LIMIT_MAX_BUCKETS', group: '号池与限流', label: '限流桶上限', type: 'number', min: 1, help: '限制内存里保留多少个客户端 IP 的桶' },
+  { key: 'TRUST_PROXY', group: '服务与鉴权', label: '信任代理头', type: 'text', help: '反代场景填 loopback；留空则只认 socket 地址（伪造 XFF 无效）' },
+  { key: 'CORS_ORIGIN', group: '服务与鉴权', label: '允许跨域来源', type: 'text', help: '* 适合大多数 SDK；收紧成具体域名更安全' },
+
+  /* ------------------------ 发送与节奏 ------------------------ */
+  { key: 'SEND_INTERVAL_MS', group: '运行与并发', label: '发送间隔（毫秒）', type: 'number', min: 0, help: '浏览器引擎的账号级限流，太密会触发「发送过于频繁」' },
+  { key: 'DIRECT_SEND_INTERVAL_MS', group: '运行与并发', label: '直连发送间隔（毫秒）', type: 'number', min: 0, help: '直连不做间隔，靠号池绕限流' },
+  { key: 'POLL_INTERVAL_MS', group: '运行与并发', label: '轮询间隔（毫秒）', type: 'number', min: 10 },
+  { key: 'SETTLE_MS', group: '运行与并发', label: '结束判定稳定期（毫秒）', type: 'number', min: 0, help: '文本稳定多久算生成结束' },
+  { key: 'REASONING_HOLD_MS', group: '运行与并发', label: '思考内容保持（毫秒）', type: 'number', min: 0, help: '保证 reasoning 一定排在 content 前面' },
+  { key: 'RATE_LIMIT_BACKOFF_MS', group: '运行与并发', label: '限流退避（毫秒）', type: 'number', min: 0 },
+  { key: 'IDLE_SHUTDOWN_MS', group: '运行与并发', label: '空闲关闭浏览器（毫秒）', type: 'number', min: 0, help: '0 = 不关闭' },
+  { key: 'SHUTDOWN_TIMEOUT_MS', group: '运行与并发', label: '关闭超时（毫秒）', type: 'number', min: 1000, help: '容器默认 stop 宽限 10s，建议保持小于它' },
+  { key: 'POW_WORKERS', group: '号池与限流', label: 'PoW 并行度', type: 'number', min: 0, help: '0 = 用 CPU 核数；高并发时可调小避免抢核' },
+
+  /* ------------------------ 直连特征伪装 ------------------------ */
+  { key: 'DEEPSEEK_BASE_URL', group: '直连特征', label: '上游地址', type: 'text', help: '一般不需要改' },
+  { key: 'DEEPSEEK_DEVICE_PROFILE', group: '直连特征', label: '设备画像', type: 'select', options: ['chrome-win', 'chrome-android'], help: '选定后请长期固定，来回切换会被识别成设备漂移' },
+  { key: 'DEEPSEEK_COLD_START', group: '直连特征', label: '冷启动序列', type: 'boolean', help: '启动时先拉配置、校验设备，让账号有「网页打开过」的痕迹' },
+  { key: 'DEEPSEEK_HUMAN_TIMING', group: '直连特征', label: '行为时序伪装', type: 'boolean', help: '把 PoW 耗时补到接近真浏览器，并在发送前随机停顿' },
+  { key: 'DEEPSEEK_MANAGE_TOGGLES', group: '直连特征', label: '主动拨动开关', type: 'boolean', help: '按请求要求把网页上的深度思考/智能搜索拨到对应状态' },
+
+  /* ------------------------ 浏览器引擎 ------------------------ */
+  { key: 'BROWSER_HEADLESS', group: '浏览器引擎', label: '无头模式', type: 'boolean' },
+  { key: 'BROWSER_USER_AGENT', group: '浏览器引擎', label: '浏览器 UA', type: 'text' },
+  { key: 'BROWSER_WIDTH', group: '浏览器引擎', label: '窗口宽', type: 'number', min: 200 },
+  { key: 'BROWSER_HEIGHT', group: '浏览器引擎', label: '窗口高', type: 'number', min: 200 },
+  { key: 'BROWSER_LOCALE', group: '浏览器引擎', label: '语言', type: 'text' },
+  { key: 'BROWSER_SLOW_MO', group: '浏览器引擎', label: '操作减速（毫秒）', type: 'number', min: 0, help: '调试用，每步操作的人为延迟' },
+  { key: 'BROWSER_NAV_TIMEOUT_MS', group: '浏览器引擎', label: '页面导航超时（毫秒）', type: 'number', min: 1000 },
+  { key: 'BROWSER_ARGS', group: '浏览器引擎', label: '额外启动参数', type: 'text', help: '空格分隔，如 --proxy-server=http://127.0.0.1:7890' },
+  { key: 'BROWSER_CAPTURE', group: '浏览器引擎', label: '抓取原始流', type: 'boolean', help: '用模型原始输出当权威文本；关掉退回纯 DOM 提取（可能丢工具调用）' },
+  { key: 'BROWSER_CAPTURE_WAIT_MS', group: '浏览器引擎', label: '原始流收尾等待（毫秒）', type: 'number', min: 0 },
 ];
 
 const STATIC_MIME = {
@@ -414,95 +464,124 @@ export function createAdminHandler({ config, logger, web, server }) {
     }
   }
 
+  /**
+   * 配置页数据。
+   *
+   * 取值顺序要与 config.mjs 的优先级一致：网页设置 > 环境变量 > .env > 默认。
+   * 这里 currentEffective() 已经是「进程内实际生效值」—— 而进程内的值
+   * 就是 config.mjs 按上述优先级算出来的，所以直接用它做回退即可。
+   * 优先显示 settings.json 里的值（用户显式保存过的），语义上最接近「我设的」。
+   */
   function buildConfig() {
-    const fromFile = readEnvFile();
+    const saved = loadSettings(config.settingsFile);
     const values = {};
     for (const item of ENV_SCHEMA) {
-      const current = fromFile[item.key] ?? currentEffective(item.key);
+      const current = saved.values[item.key] ?? currentEffective(item.key);
       values[item.key] = current === undefined || current === null ? '' : String(current);
     }
-    const writable = envWritable();
-    const runtimeMode = detectRuntimeMode();
+    const writable = settingsWritable(config.settingsFile);
     return {
-      envFile,
-      exists: fs.existsSync(envFile),
-      // 只读环境（容器）：前端据此禁用表单并展示说明，而不是让用户点保存才吃到 409
-      writable: writable.ok,
-      writableHint: writable.ok ? null : writable.message,
-      runtimeMode,
+      // 兼容旧字段名：前端和历史调用方还在读 envFile
+      envFile: config.settingsFile,
+      settingsFile: config.settingsFile,
+      exists: fs.existsSync(config.settingsFile),
+      // 配置目录不可写时前端禁用表单并说明原因，而不是让用户点保存才吃到 409
+      writable,
+      writableHint: writable
+        ? null
+        : `配置目录不可写：${path.dirname(config.settingsFile)}。容器里请确认已挂载数据卷 -v cz-dsapi-data:/app/data`,
+      runtimeMode: detectRuntimeMode(),
+      // 设置文件损坏时提醒用户（此时会静默回落到环境变量，不说会让人困惑）
+      broken: saved.broken,
       schema: ENV_SCHEMA,
       values,
-      restartKeys: ['ENGINE', 'HOST', 'PORT', 'API_KEY', 'CONCURRENCY', 'MAX_PROMPT_CHARS', 'DEEPSEEK_THINKING', 'DEEPSEEK_SEARCH', 'LOG_LEVEL', 'ACCOUNT_PROBE_INTERVAL_MS'],
-      note: writable.ok
-        ? '修改会写回项目根目录的 .env，重启服务后生效。'
-        : '当前环境（容器）的 .env 只读，请通过环境变量配置后重启容器。',
+      restartKeys: [
+        'ENGINE',
+        'HOST',
+        'PORT',
+        'API_KEY',
+        'CONCURRENCY',
+        'MAX_PROMPT_CHARS',
+        'DEEPSEEK_THINKING',
+        'DEEPSEEK_SEARCH',
+        'LOG_LEVEL',
+        'ACCOUNT_PROBE_INTERVAL_MS',
+      ],
+      note: writable
+        ? `修改会保存到 ${SETTINGS_FILENAME}（数据目录），重启服务后生效。`
+        : `配置目录不可写，无法保存。容器里请确认已挂载数据卷。`,
     };
   }
 
+  /**
+   * 保存网页设置。
+   *
+   * 写入 data/settings.json（**不再写 .env**），原因见 settings-store.mjs 顶部：
+   * .env 在容器里既写不进去，就算写进去了也会被环境变量盖住 —— 静默失效。
+   *
+   * 合并而非覆盖：只写本次提交的项，其余已有设置保留。
+   * 显式清空（值为空串）则从文件里删掉该键，回落到环境变量 / 默认值 ——
+   * 否则用户永远没法「恢复默认」，只能手改文件。
+   */
   function saveConfig(body) {
     const incoming = body?.values;
     if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) {
       throw new ApiError(400, 'values 必须是对象');
     }
 
-    // 容器里 /app 是 root 拥有只读、进程以 node 身份跑，.env 根本写不进去。
-    // 提前拦下来给一条能照做的提示，比让它变成 500 + EACCES 堆栈强得多。
-    const writable = envWritable();
-    if (!writable.ok) {
-      throw new ApiError(409, writable.message, { code: 'env_not_writable' });
+    const target = config.settingsFile;
+    if (!settingsWritable(target)) {
+      throw new ApiError(
+        409,
+        `配置目录不可写：${path.dirname(target)}\n` +
+          '容器里请确认已挂载可写的数据卷：-v cz-dsapi-data:/app/data',
+        { code: 'settings_not_writable' },
+      );
     }
 
     const updates = {};
     for (const item of ENV_SCHEMA) {
       if (!(item.key in incoming)) continue;
-      updates[item.key] = validateEnvValue(item, incoming[item.key]);
+      const raw = incoming[item.key];
+
+      // API_KEY 在页面上是掩码显示（见 currentEffective 的 '••••••••'）。
+      // 用户只改别的项时，浏览器会把掩码原样提交回来 —— 若当成真值存下去，
+      // 重启后鉴权 KEY 就变成了那串圆点，而用户完全不知道发生了什么。
+      // 这里识别掩码并跳过：语义是「没改」，不是「清空」。
+      if (item.type === 'password' && typeof raw === 'string' && /^[•*]+$/.test(raw.trim())) {
+        continue;
+      }
+
+      const value = validateEnvValue(item, raw);
+      updates[item.key] = value;
     }
-    if (!Object.keys(updates).length) throw new ApiError(400, '没有需要保存的配置');
+    if (!Object.keys(updates).length) {
+      return { ok: true, saved: [], settingsFile: target, restartRequired: false, message: '没有需要保存的改动。' };
+    }
+
+    const current = loadSettings(target).values;
+    const next = { ...current };
+    for (const [k, v] of Object.entries(updates)) {
+      // 空串 = 恢复默认（交还给环境变量 / 内置默认值）
+      if (v === '') delete next[k];
+      else next[k] = v;
+    }
+
     try {
-      writeEnvFile(updates);
+      saveSettings(target, next);
     } catch (err) {
-      // 上面探过可写，走到这里是磁盘满 / 只读挂载等少见情况，同样别抛 500
-      throw new ApiError(409, `写入 .env 失败：${err.message}`, { code: 'env_write_failed' });
+      throw new ApiError(409, `写入 ${SETTINGS_FILENAME} 失败：${err.message}`, {
+        code: 'settings_write_failed',
+      });
     }
-    log.info('配置已写入 .env', { keys: Object.keys(updates) });
+
+    log.info('配置已写入 settings.json', { keys: Object.keys(updates), file: target });
     return {
       ok: true,
       saved: Object.keys(updates),
-      envFile,
+      settingsFile: target,
       restartRequired: true,
-      message: '已写入 .env，重启服务后生效。',
-    };
-  }
-
-  /**
-   * 探测 .env 是否可写。
-   *
-   * 三种情况都要覆盖：文件存在（直接 open 追加探）+ 文件不存在但目录可写
-   * （新建探）+ 两者都不可（容器默认形态，/app 只读）。
-   * 用 append 而不是 truncate，避免探测本身把用户的配置清空。
-   */
-  function envWritable() {
-    try {
-      fs.accessSync(envFile, fs.constants.W_OK);
-      return { ok: true };
-    } catch {
-      /* 文件不存在或不可写，再探目录 */
-    }
-    try {
-      fs.accessSync(path.dirname(envFile), fs.constants.W_OK);
-      return { ok: true };
-    } catch {
-      /* 目录也不可写 */
-    }
-    return {
-      ok: false,
-      message:
-        `容器里的 .env 不可写（${envFile}）。这是预期行为：镜像中 /app 是只读的，` +
-        '配置应当通过环境变量传入。\n' +
-        '请改用以下任一方式，然后 docker restart 容器：\n' +
-        '  docker run 时加  -e KEY=VALUE\n' +
-        '  或在 docker-compose.yml 的 environment: 段里声明\n' +
-        '  或挂载一个可写目录：-v cz-dsapi-data:/app/data 后把配置写进 .env 再挂进来',
+      message: '已保存，重启服务后生效。',
     };
   }
 
@@ -532,55 +611,85 @@ export function createAdminHandler({ config, logger, web, server }) {
     return value;
   }
 
-  function readEnvFile() {
-    try {
-      return parseEnvText(fs.readFileSync(envFile, 'utf8'));
-    } catch {
-      return {};
-    }
-  }
-
-  /** 当前进程里生效的值（没有写进 .env 但会从默认值/环境变量来） */
+  /**
+   * 当前进程里生效的值（由 config.mjs 按 网页设置 > 环境变量 > 默认 算出来的结果）。
+   *
+   * 必须覆盖 ENV_SCHEMA 的**全部**键：漏一个，那一项在页面上就显示成空白，
+   * 用户会以为没设置过，保存时还可能被空串覆盖回去。
+   * test/admin-settings.test.mjs 里有一条断言专门守这个一致性。
+   */
   function currentEffective(key) {
+    const b = (v) => String(v);
     const mapping = {
+      /* 引擎与模型 */
       ENGINE: config.engine,
       DEEPSEEK_THINKING: config.deepseek.thinking,
-      DEEPSEEK_SEARCH: String(config.deepseek.search),
+      DEEPSEEK_SEARCH: b(config.deepseek.search),
       DEFAULT_MODEL: config.deepseek.defaultModel,
-      LOG_LEVEL: config.logLevel,
-      CONCURRENCY: String(config.runtime.concurrency),
-      QUEUE_LIMIT: String(config.runtime.queueLimit),
-      REQUEST_TIMEOUT_MS: String(config.runtime.requestTimeoutMs),
-      FIRST_TOKEN_TIMEOUT_MS: String(config.runtime.firstTokenTimeoutMs),
-      MAX_PROMPT_CHARS: String(config.runtime.maxPromptChars),
-      MAX_ATTACHMENT_CHARS: String(config.runtime.maxAttachmentChars),
-      OVERFLOW_TO_ATTACHMENT: String(config.runtime.overflowToAttachment),
-      WARMUP: String(config.runtime.warmup),
-      SAVE_ARTIFACTS: String(config.runtime.saveArtifacts),
-      ACCOUNT_COOLDOWN_MS: String(config.runtime.accountCooldownMs),
-      ACCOUNT_PROBE_INTERVAL_MS: String(config.runtime.accountProbeIntervalMs ?? 0),
+      DEEPSEEK_BASE_URL: config.deepseek.baseUrl,
+      DEEPSEEK_DEVICE_PROFILE: config.deepseek.deviceProfile,
+      DEEPSEEK_COLD_START: b(config.deepseek.coldStart),
+      DEEPSEEK_HUMAN_TIMING: b(config.deepseek.humanTiming),
+      DEEPSEEK_MANAGE_TOGGLES: b(config.deepseek.manageToggles),
+
+      /* 服务与鉴权 */
       HOST: config.server.host,
-      PORT: String(config.server.port),
+      PORT: b(config.server.port),
       API_KEY: config.server.apiKey ? '••••••••' : '',
+      CORS_ORIGIN: config.server.cors,
+      TRUST_PROXY: config.server.trustProxy,
+      LOG_LEVEL: config.logLevel,
+
+      /* 限流 */
+      RATE_LIMIT_ENABLED: b(config.server.rateLimit.enabled),
+      RATE_LIMIT_PER_MINUTE: b(config.server.rateLimit.capacity),
+      RATE_LIMIT_REFILL_PER_SEC: b(config.server.rateLimit.refillPerSec),
+      RATE_LIMIT_MAX_BUCKETS: b(config.server.rateLimit.maxBuckets),
+
+      /* 号池 */
+      MAX_INFLIGHT_PER_ACCOUNT: b(config.direct.maxInflightPerAccount),
+      MAX_COOLDOWN_WAIT_MS: b(config.runtime.maxCooldownWaitMs),
+      ACCOUNT_COOLDOWN_MS: b(config.runtime.accountCooldownMs),
+      ACCOUNT_PROBE_INTERVAL_MS: b(config.runtime.accountProbeIntervalMs ?? 0),
+      POW_WORKERS: b(config.direct.powWorkers),
+
+      /* 运行与节奏 */
+      CONCURRENCY: b(config.runtime.concurrency),
+      QUEUE_LIMIT: b(config.runtime.queueLimit),
+      REQUEST_TIMEOUT_MS: b(config.runtime.requestTimeoutMs),
+      FIRST_TOKEN_TIMEOUT_MS: b(config.runtime.firstTokenTimeoutMs),
+      SEND_INTERVAL_MS: b(config.runtime.sendIntervalMs),
+      DIRECT_SEND_INTERVAL_MS: b(config.runtime.directSendIntervalMs),
+      POLL_INTERVAL_MS: b(config.runtime.pollIntervalMs),
+      SETTLE_MS: b(config.runtime.settleMs),
+      REASONING_HOLD_MS: b(config.runtime.reasoningHoldMs),
+      RATE_LIMIT_BACKOFF_MS: b(config.runtime.rateLimitBackoffMs),
+      IDLE_SHUTDOWN_MS: b(config.runtime.idleShutdownMs),
+      SHUTDOWN_TIMEOUT_MS: b(config.runtime.shutdownTimeoutMs),
+
+      /* 长上下文 */
+      MAX_PROMPT_CHARS: b(config.runtime.maxPromptChars),
+      MAX_ATTACHMENT_CHARS: b(config.runtime.maxAttachmentChars),
+      OVERFLOW_TO_ATTACHMENT: b(config.runtime.overflowToAttachment),
+
+      /* 开关 */
+      WARMUP: b(config.runtime.warmup),
+      SAVE_ARTIFACTS: b(config.runtime.saveArtifacts),
+
+      /* 浏览器引擎 */
+      BROWSER_HEADLESS: b(config.browser.headless),
+      BROWSER_USER_AGENT: config.browser.userAgent,
+      BROWSER_WIDTH: b(config.browser.viewport.width),
+      BROWSER_HEIGHT: b(config.browser.viewport.height),
+      BROWSER_LOCALE: config.browser.locale,
+      BROWSER_SLOW_MO: b(config.browser.slowMo),
+      BROWSER_NAV_TIMEOUT_MS: b(config.browser.navigationTimeoutMs),
+      // 数组还原成命令行形式，否则页面上会显示成 "a,b"
+      BROWSER_ARGS: (config.browser.launchArgs || []).join(' '),
+      BROWSER_CAPTURE: b(config.runtime.browserCapture),
+      BROWSER_CAPTURE_WAIT_MS: b(config.runtime.browserCaptureWaitMs),
     };
     return mapping[key];
-  }
-
-  function writeEnvFile(updates) {
-    const lines = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8').split(/\r?\n/) : [];
-    const seen = new Set();
-    const next = lines.map((line) => {
-      const match = /^(\s*)([A-Za-z0-9_]+)\s*=/.exec(line);
-      if (match && Object.hasOwn(updates, match[2])) {
-        seen.add(match[2]);
-        return `${match[2]}=${updates[match[2]]}`;
-      }
-      return line;
-    });
-    for (const [key, value] of Object.entries(updates)) {
-      if (!seen.has(key)) next.push(`${key}=${value}`);
-    }
-    fs.writeFileSync(envFile, `${next.join('\n').replace(/\n+$/, '')}\n`, { mode: 0o600 });
   }
 
   function readLogTail(lines) {
