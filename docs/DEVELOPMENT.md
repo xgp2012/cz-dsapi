@@ -89,7 +89,8 @@ node src/index.mjs
 
 ```
 src/index.mjs            进程入口：加载配置 → 建引擎 → 建 server → listen → 信号处理
-src/config.mjs           环境变量 → config 对象（含极简 .env 加载）
+src/config.mjs           环境变量 → config 对象（含极简 .env 加载 + 叠加 settings.json）
+src/settings-store.mjs   网页设置的持久化：data/settings.json 的读/写/探测/优先级叠加（见 §14.8）
 src/engine.mjs           按 ENGINE/依赖条件选择 DirectEngine 或 DeepSeekWeb
 src/server.mjs           HTTP 路由 + OpenAI 两端口 + 两个协议共用的响应编排
 src/chat-runner.mjs      协议无关的执行逻辑（拼 prompt / 上传 / 解析 / 流式收尾对齐）
@@ -1195,7 +1196,7 @@ ApiError(status, message, {type, code, param})
 | POST | `/admin/api/accounts/verify` | 逐条校验**刚粘贴的 token**（**会真的发一条最短消息**）；同一时间只允许一批 |
 | POST | `/admin/api/accounts/probe` | 立即复检**运行中的号池**（不消耗消息额度，见 §6.6）；`probeRunning` 串行；返回 `{ok, probed, ms, results}` |
 | POST | `/admin/api/accounts/remove` | `{index}`（1 起）；不允许删到空 |
-| GET/PUT | `/admin/api/config` | 读写项目根 `.env`（`ENV_SCHEMA` 白名单 + 逐项校验） |
+| GET/PUT | `/admin/api/config` | 读写 `data/settings.json`（`ENV_SCHEMA` 51 项白名单 + 逐项校验 + 掩码保护）；返回 `writable`/`writableHint`/`settingsFile`/`broken`（见 §14.8） |
 | GET | `/admin/api/logs?lines=` | 读 `data/server.log` 尾部（最多 512KB，clamp 50–5000） |
 | POST | `/admin/api/restart` | 分两种形态：源码 → `spawn(node, server-ctl restart)`；打包 exe → 自行重启（见下） |
 
@@ -1249,7 +1250,9 @@ ApiError(status, message, {type, code, param})
 | 直连故障切换 | `direct-failover.test.mjs` | 假 DeepSeek + **真实 `bin/ds-pow`** |
 | 直连 PoW 池 | `pow-cache.test.mjs` | 纯函数部分无依赖；「池行为」两条起**本地假上游 + 真实 `bin/ds-pow`**（黑盒验证过期件丢弃与预解复用） |
 | 账号探活 | `account-probe.test.mjs` | **无网络**：只测 `AccountPool` 的候选/恢复语义与 `classifyProbeFailure` 分级，不真的探上游（见 §6.6） |
-| 进程与配置 | `setup.test.mjs`（首次配置引导、`.env` 解析/写回）、`restart.test.mjs`（重启语义与 `packaged` 判定） | 无网络；`restart` 只断言判定逻辑，不真的重启进程 |
+| 设置持久化 | `settings-store.test.mjs`（读/写/损坏容错/原子性/优先级叠加）、`admin-settings.test.mjs`（schema 与 mapping 的一致性守卫） | 无网络；用临时目录，不碰真实 `data/`（见 §14.8） |
+| 容器适配 | `container.test.mjs` | 无网络；验证本地时间戳、只读判定、关闭超时 < 10s 宽限 |
+| 进程与配置 | `setup.test.mjs`（首次配置引导、`.env` 解析/写回）、`restart.test.mjs`（重启语义与 `detectRuntimeMode` 三形态判定） | 无网络；`restart` 只断言判定逻辑，不真的重启进程 |
 | 端到端 | `scripts/smoke.mjs` | **真实账号**（会消耗额度） |
 | 端到端（离线） | `test/e2e/run.mjs` | 假上游 `test/e2e/fake-upstream.mjs` + 真起服务（独立进程走 `index.mjs`），**不消耗额度**；`npm test` **不**包含它，需手动 `node test/e2e/run.mjs [--only auth]` |
 
@@ -1300,10 +1303,15 @@ gh run list --repo <owner>/<repo>        # 看 CI 结果
 |---|---|---|
 | `go test ./...` | 通过 | PoW 哈希/求解全部通过 |
 | `npm run pow:build` | 生成 `bin/ds-pow`（Windows：`bin/ds-pow.exe`） | 与测试向量一致 |
-| `npm test` | **279 tests / 279 pass / 0 fail / 0 skipped**（轻量组）+ 浏览器组单独 **19 / 19 pass** | 合计 298。浏览器组需要本机有 Playwright 的 Chromium，缺失时自动 skip；两组由 `scripts/test.mjs` 分批跑（见 §14.1） |
+| `npm test` | **309 tests / 309 pass / 0 fail / 0 skipped**（轻量组）+ 浏览器组单独 **19 / 19 pass** | 合计 328。浏览器组需要本机有 Playwright 的 Chromium，缺失时自动 skip；两组由 `scripts/test.mjs` 分批跑（见 §14.1） |
 
 > 数字会随改动增长，别把它当基线卡死。真正的判据是 **0 fail / 0 skipped**；
 > 如果 `npm test` 报的数字明显少于上表，先确认是不是浏览器组被 skip 了。
+
+> **`driver.test.mjs` 偶发 1 例失败属已知现象**：该文件有多个用例刻意把超时压到
+> `FIRST_TOKEN_TIMEOUT_MS: '400'` / `BROWSER_NAV_TIMEOUT_MS: '2500'` 来验超时逻辑，
+> 真实 Chromium 启停在机器负载高时会越过这些阈值。判断方法：**重跑一次**，
+> 全绿即可判定为偶发；连续两次失败才需要当作真问题查。
 
 **Windows 上的 `.exe` 问题已修复**（原 T2 的 Windows 部分）：根因是 Node 的 `spawn` 只对"不带路径的命令名"
 按 PATHEXT 补扩展名，而这里给的是完整文件名；Go 的 `-o` 又不会自动加 `.exe`。现在两道保险：
@@ -1607,6 +1615,37 @@ runtime  node:22-bookworm-slim   apt 运行时库 + 生产依赖 + chromium-head
 > 用户以为没设置过，保存时还可能被空串覆盖。开发中真实发生过（schema 加到 51 项时
 > mapping 还停在 19 项），所以 `test/admin-settings.test.mjs` 里有一条断言专门守这个一致性。
 
+**新增一个可调配置项的完整步骤**（漏一步就会出现「设了不生效」或「页面空白」）：
+
+1. `src/config.mjs` 里加 `ENV.XXX` 的解析（`str/int/bool/float` 之一），落在合适的子对象上；
+2. `src/admin/routes.mjs` 的 `ENV_SCHEMA` 里加一条（含 `key/label/type/group`，
+   `type` 决定前端控件；`select` 要带 `options`，`number` 建议带 `min`）；
+3. 同一个文件里的 `currentEffective()` 补上映射 —— **这一步最容易漏**；
+4. 若该项属于「改了要重启」的范围，加进 `buildConfig()` 的 `restartKeys`；
+5. 跑 `node --test test/admin-settings.test.mjs`，第 1 条用例会立刻报出漏掉的键名。
+
+**排查「我改了配置但没生效」的固定顺序**：
+
+```bash
+# 1. 看文件里到底存了什么（网页保存的才会在这里）
+cat data/settings.json
+
+# 2. 看进程实际算出什么值（这是 config.mjs 合并三层后的结果）
+#    后台：GET /admin/api/config → values 字段就是当前生效值
+#    命令行：/healthz 里有部分摘要；更全的用下面的探针
+node -e "import('./src/config.mjs').then(m=>{const c=m.loadConfig();
+  console.log({engine:c.engine, concurrency:c.runtime.concurrency, logLevel:c.logLevel,
+               settingsFile:c.settingsFile, broken:c.settingsBroken})})"
+```
+
+优先级是 **网页设置 > 环境变量 > `.env` > 默认值**，所以：
+`settings.json` 里有键 → 网页值胜出；没有 → 环境变量；再没有 → `.env`；最后才是内置默认值。
+**清空页面上某一项 = 从 `settings.json` 删掉该键**，从而回落到下一层。
+
+> 注意 `loadConfig()` 的 `dataDir` 是从 `DATA_DIR` 算出来的，而 `settings.json` 又在 `dataDir` 里。
+> 若把 `DATA_DIR` 改到一个新目录，重启后读的是**新目录下的** `settings.json`（旧配置不会被带过去）——
+> 这个行为是有意的，否则「改了数据目录却没搬家」会读到一个幽灵配置。
+
 #### 容器的其他特异性问题
 
 这些问题在本机开发时**全部不复现**，只有真正跑进镜像才暴露：
@@ -1760,6 +1799,10 @@ curl -s -H "Authorization: Bearer <token>" \
 | T16 | 开发机没有 Docker，镜像只能靠 CI 构建后间接验证 | 无法本地 `docker run` 复现容器内问题 | 已在 §14.9 给出三步替代验证（静态检查 / CI 日志 / 读 Registry config）。有 Docker 的机器建议至少跑一次 `docker run` 验证 browser 引擎 |
 | T17 | 探活的 `INVALID_TOKEN` 判定偏保守（见 §6.6）：上游这个错误不带 401/403，被归到 `unknown`，不会立即判死 | 真失效的号会多探几轮才确认；`/healthz` 上看起来还是「冷却中」而不是「登录态失效」 | 想收紧就在 `classifyProbeFailure` 加文案匹配（`/INVALID_TOKEN/i`），但文案随上游改版而变，误判代价是把好号锁死 —— 当前选择宁可多探几轮 |
 | T18 | 探活只覆盖**直连引擎**；browser 引擎单 token、无号池，`supported()` 直接返回 false | browser 引擎下 token 失效仍然只能人工重启 | 要先给 browser 引擎做多账号（T10），探活才有意义；两者应该一起做 |
+| T19 | 配置项改动后**必须重启**才生效，没有热重载 | 改并发、超时这类「其实可以热切」的项也要中断正在进行的对话 | 大部分配置在请求路径上是读取即用，做热重载可行但要逐项确认哪些真的安全；`restartKeys` 已经标出「必须重启」的子集，可作为切入点 |
+| T20 | `settings.json` 与 `.env` 并存，同一个键可能出现在两处 | 排查「为什么是这个值」时容易看错文件 | 优先级已在 §14.8 写明（网页 > 环境变量 > .env > 默认），且 `GET /admin/api/config` 的 `values` 直接给出生效值；长期看可以去掉 `.env` 这一层 |
+| T21 | CI 只做镜像构建，**不跑测试**（`docker.yml` 明确不跑） | 破坏性改动只要能让镜像构建成功就会被合并 | 加一个 `npm test` 的 job 即可（十几行），但浏览器组需要先处理 Chromium 安装；建议先只跑轻量组 |
+| T22 | `driver.test.mjs` 用 400ms / 2500ms 这类极短超时验超时逻辑 | 机器负载高时偶发 1 例失败，容易误判成回归 | 已写入 §14.3 的「重跑一次判定偶发」；彻底解法是把超时改成可注入的假时钟，但改动面较大 |
 
 ---
 

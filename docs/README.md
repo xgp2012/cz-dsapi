@@ -21,7 +21,7 @@ npm run setup:browser  # 下载 Playwright 的 Chromium（browser 引擎与浏�
 npm run pow:build      # 编译 Go PoW 求解器 → bin/ds-pow（Windows 上是 bin/ds-pow.exe）
 npm run auth -- '<userToken>'
 npm start              # 前台跑；或用 npm run up 后台跑
-npm test               # 286 个用例（267 + 19 浏览器）；没有 Chromium 时浏览器用例会自动 skip
+npm test               # 328 个用例（309 + 19 浏览器）；没有 Chromium 时浏览器用例会自动 skip
 npm run exe            # 打包成 Windows 单 exe → dist/win-x64/（目标机器零安装）
 docker build -t cz-dsapi .   # 构建镜像（需要本地有 docker）
 ```
@@ -63,7 +63,9 @@ Compose 版已经把容器专属的注意事项预置好了，其中两个是「
 - `API_KEY` 用 `${CZ_API_KEY:?}` 写成**必填**：容器默认监听 `0.0.0.0`，
   漏设就等于把号池额度白送出去。没填时 compose 会直接报错拒绝启动，而不是静默跑起来。
 
-配置全部走 `environment:`，因为镜像里 `/app` 只读、`.env` 写不进去（见 [§14.8](./DEVELOPMENT.md#148-docker-镜像dockerfile)）。
+**其余可调配置请在控制台「设置」页改**（保存到数据卷里的 `settings.json`，重启生效），
+`environment:` 里只保留 API_KEY / token / TZ 这几项启动前就必须确定的。
+早期版本把配置写回 `/app/.env`，在容器里必然失败（`/app` 只读），现已改到数据目录，见 [§14.8](./DEVELOPMENT.md#148-docker-镜像dockerfile)。
 
 exe 产物里 `src/`、`node_modules/`、`ms-playwright/` 必须和 `cz-dsapi.exe` 同目录 ——
 SEA 内嵌代码只能按 CommonJS 执行，装不下 ESM 源码。原因与两个 playwright 坑见
@@ -90,5 +92,6 @@ CI 细节（缓存、标签规则、如何在没有本地 Docker 时验证）见
 | 并发上不去 / 全都压在一个号上 | [6.5 并发模型](./DEVELOPMENT.md#65-并发模型两条流水线) |
 | 镜像构建失败 / 体积异常 / 拉不到镜像 | [14.8 Docker 镜像](./DEVELOPMENT.md#148-docker-镜像dockerfile)、[14.9 CI](./DEVELOPMENT.md#149-cigithub-actions-构建镜像githubworkflowsdockeryml) |
 | exe 起不来 / 重启失败 | [14.7 打包成 Windows 单 exe](./DEVELOPMENT.md#147-打包成-windows-单-exescriptsbuild-exemjs) |
+| 网页改了配置没生效 / 设置页不能保存 | [14.8 网页设置存在 settings.json](./DEVELOPMENT.md#网页设置存在-datasettingsjson不再写-env)（优先级与排查命令） |
 
 > 本文档基于仓库当前源码逐文件核对编写；文中引用的方法名、常量值与分支条件均对应实际实现。改动相关代码时请顺手同步对应章节。
